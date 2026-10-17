@@ -16,3 +16,5 @@ Delta Owner: Keine weiteren Vergleiche;1.45 aktivieren und laufen lassen.32k-Ver
 Naechster Schritt: Nur Health/Identität prüfen und aktive Version persistieren.
 Erledigt:1.45 live, Health geladen, neuer Server-CWD/Config/Engine-Hash geprüft; Engine-Env und Originalconfig unverändert. start144/start145 wählen server_repo aus Config, Default jetzt1.45. Keine weiteren Vergleiche oder Inferenzrequests nach Owner-Delta.
 Naechster Schritt: Normalbetrieb auf1.45; kein weiterer Test geplant.
+
+Auftrag: Optionales Checkpoint-Staging portieren und B70-Gewinn prüfen. Backups im Auftrag-Workspace work/checkpoint-backup. Opt-in-Pfad mit Payload-Vergleich und Timing implementiert; Default unverändert. Nächster Schritt: Build, dann kontrollierter Vergleich mit Restore.

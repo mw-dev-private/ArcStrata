@@ -70,6 +70,10 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, 
                                       const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
                                   const ModelGeometry& g, std::string& error);
+// Optional SYCL checkpoint staging; the baseline save/restore contract is unchanged.
+size_t conversation_checkpoint_staged_bytes(const SessionState&, const ModelGeometry&);
+bool conversation_checkpoint_stage(void*, void*, const SessionState&, const ModelGeometry&, size_t, std::string&);
+bool conversation_checkpoint_unstage(ConversationCheckpoint&, const void*, const SessionState&, const ModelGeometry&, std::string&);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
 // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two

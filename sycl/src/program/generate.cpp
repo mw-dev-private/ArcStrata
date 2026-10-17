@@ -7847,36 +7847,19 @@ int main(int argc, char **argv) try {
           std::exit(1);
         }
         };
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
-            ckpt_why.clear();
-            if (o.prompt_cache <= 0 || L < 1) return true;
-            for (ConvCheckpoint& c : checks)
-                if ((int64_t) c.ids.size() == L) {
-                    c.used = ++check_clock;
-                    if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
-                    return true;
-                }
-            ConvCheckpoint c;
-            c.ids.assign(cur.begin(), cur.begin() + L);
-            c.imgs = imgs_below(req_imgs, L);
-            if (parts != nullptr) {
-                if (parts->size() != stages.size() + 1) return false;
-                c.gdn = std::move((*parts)[0].gdn);
-                c.ple = std::move((*parts)[0].ple);
-                c.tails = std::move((*parts)[0].tails);
-                c.dead = std::move((*parts)[0].dead);
-                c.block_pos = std::move((*parts)[0].block_pos);
-                for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
-            } else {
-                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
-                for (auto& st : stages) {   // a layer split's later stages: their sessions' part
-                    const strata::core::OnDevice on(st->dev);
-                    ConvCheckpoint part;
-                    part.ids = c.ids;
-                    if (!gpu_sync_ok() || !checkpoint_save(part, st->ss, g)) return false;
-                    c.stage_parts.push_back(std::move(part));
-                }
-            }
+        const bool ckpt_stage_on = [] { const char* v = std::getenv("STRATA_CKPT_STAGE"); return v && std::atoi(v) == 1; }();
+        const bool ckpt_check = std::getenv("STRATA_CKPT_STAGE_CHECK") != nullptr;
+        const bool ckpt_timing = std::getenv("STRATA_CKPT_TIMING") != nullptr;
+        auto host_free = [](void* p) { if (p) sycl::free(p, dpct::get_in_order_queue()); };
+        std::unique_ptr<void, decltype(host_free)> ckpt_buffer(nullptr, host_free);
+        if (ckpt_stage_on && stages.empty() && o.prompt_cache > 0) {
+            try { ckpt_buffer.reset(sycl::malloc_host(strata::core::conversation_checkpoint_staged_bytes(ss, g), dpct::get_in_order_queue())); }
+            catch (const sycl::exception&) { /* optional allocation: retain baseline */ }
+        }
+        ConvCheckpoint pending_checkpoint;
+        int64_t pending_len = -1;
+        bool pending_tail = false;
+        auto keep_checkpoint = [&](ConvCheckpoint&& c, int64_t L, bool as_tail) {
             c.used = ++check_clock;
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
                 const int64_t old_tail = tail_ckpt_len;
@@ -7903,6 +7886,63 @@ int main(int argc, char **argv) try {
                     stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get());
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
+        };
+        auto finish_checkpoint = [&]() -> bool {
+            if (pending_len < 0) return true;
+            std::string error;
+            if (!strata::core::conversation_checkpoint_unstage(pending_checkpoint, ckpt_buffer.get(), ss, g, error)) {
+                std::fprintf(stderr, "strata checkpoint unstage: %s\n", error.c_str()); return false;
+            }
+            keep_checkpoint(std::move(pending_checkpoint), pending_len, pending_tail);
+            pending_checkpoint = ConvCheckpoint{}; pending_len = -1;
+            return true;
+        };
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false, bool stage = false) -> bool {
+            ckpt_why.clear();
+            if (o.prompt_cache <= 0 || L < 1) return true;
+            for (ConvCheckpoint& c : checks)
+                if ((int64_t) c.ids.size() == L) {
+                    c.used = ++check_clock;
+                    if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
+                    return true;
+                }
+            ConvCheckpoint c;
+            c.ids.assign(cur.begin(), cur.begin() + L);
+            c.imgs = imgs_below(req_imgs, L);
+            if (parts != nullptr) {
+                if (parts->size() != stages.size() + 1) return false;
+                c.gdn = std::move((*parts)[0].gdn);
+                c.ple = std::move((*parts)[0].ple);
+                c.tails = std::move((*parts)[0].tails);
+                c.dead = std::move((*parts)[0].dead);
+                c.block_pos = std::move((*parts)[0].block_pos);
+                for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
+            } else if (stage && ckpt_buffer && pending_len < 0) {
+                const auto t0 = Clock::now();
+                if (!gpu_sync_ok() || !strata::core::conversation_checkpoint_stage(ckpt_buffer.get(), nullptr, ss, g, (size_t)L, ckpt_why)) return false;
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                if (ckpt_check) {
+                    ConvCheckpoint ref, staged; ref.ids = c.ids; staged.ids = c.ids;
+                    if (!checkpoint_save(ref, ss, g) || !strata::core::conversation_checkpoint_unstage(staged, ckpt_buffer.get(), ss, g, ckpt_why)) return false;
+                    if (ref.gdn != staged.gdn || ref.ple != staged.ple || ref.tails != staged.tails || ref.dead != staged.dead || ref.block_pos != staged.block_pos) { ckpt_why = "staged payload differs"; return false; }
+                    std::fprintf(stderr, "strata checkpoint payload EXACT tokens=%lld\n", (long long)L);
+                }
+                if (ckpt_timing) std::fprintf(stderr, "strata checkpoint save mode=stage tokens=%lld ms=%.3f\n", (long long)L, ms);
+                pending_checkpoint = std::move(c); pending_len = L; pending_tail = as_tail;
+                return true;
+            } else {
+                const auto t0 = Clock::now();
+                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
+                if (ckpt_timing) std::fprintf(stderr, "strata checkpoint save mode=baseline tokens=%lld ms=%.3f\n", (long long)L, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                for (auto& st : stages) {   // a layer split's later stages: their sessions' part
+                    const strata::core::OnDevice on(st->dev);
+                    ConvCheckpoint part;
+                    part.ids = c.ids;
+                    if (!gpu_sync_ok() || !checkpoint_save(part, st->ss, g)) return false;
+                    c.stage_parts.push_back(std::move(part));
+                }
+            }
+            keep_checkpoint(std::move(c), L, as_tail);
             return true;
         };
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
@@ -9346,6 +9386,7 @@ int main(int argc, char **argv) try {
             return true;
         };
         for (;;) {
+            if (!finish_checkpoint()) return 1;
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
@@ -10654,7 +10695,8 @@ int main(int argc, char **argv) try {
                 }
                 at = to;
                 if ((to == turn_at || to == root_at || to == message_at) &&
-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at)) {   // the tail kind leaves first
+                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at,
+                                   to == turn_at && to != root_at && to != message_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }
@@ -11770,6 +11812,7 @@ int main(int argc, char **argv) try {
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload, chain_txt);
             std::fflush(stdout);
+            if (!finish_checkpoint()) return 1;
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
