@@ -1402,6 +1402,45 @@ private:
 using ImgKey = strata::core::ConversationImageKey;
 using ConvCheckpoint = strata::core::ConversationCheckpoint;
 
+class CheckpointPool {
+public:
+    explicit CheckpointPool(bool on, size_t cap = 2) : on_(on), cap_(cap) {}
+    bool on() const { return on_; }
+    void give(ConvCheckpoint&& c) {
+        if (!on_ || c.gdn.empty()) return;
+        clear_marks(c);
+        std::lock_guard<std::mutex> lk(mu_);
+        if (free_.size() < cap_) free_.push_back(std::move(c));
+    }
+    ConvCheckpoint take() {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!on_ || free_.empty()) return ConvCheckpoint{};
+        ConvCheckpoint c = std::move(free_.back());
+        free_.pop_back();
+        return c;
+    }
+    /// v.erase(remove_if(v, drop)) with the dropped ones given to the pool (the kept ones keep their order)
+    template <class Drop> void erase_if(std::vector<ConvCheckpoint>& v, Drop drop) {
+        size_t w = 0;
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (drop(static_cast<const ConvCheckpoint&>(v[i]))) { give(std::move(v[i])); continue; }
+            if (w != i) v[w] = std::move(v[i]);
+            ++w;
+        }
+        v.erase(v.begin() + (std::ptrdiff_t) w, v.end());
+    }
+private:
+    static void clear_marks(ConvCheckpoint& c) {
+        c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false;
+        for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
+    }
+    bool on_;
+    size_t cap_;
+    std::mutex mu_;
+    std::vector<ConvCheckpoint> free_;
+};
+
+
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
     const uint8_t* p = (const uint8_t*) data;
     for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
@@ -7847,6 +7886,8 @@ int main(int argc, char **argv) try {
           std::exit(1);
         }
         };
+        const bool ckpt_pool_requested = [] { const char* v = std::getenv("STRATA_CKPT_POOL"); return v && v[0] != '0'; }();
+        CheckpointPool ckpt_pool(ckpt_pool_requested && stages.empty());
         const bool ckpt_stage_on = [] { const char* v = std::getenv("STRATA_CKPT_STAGE"); return v && std::atoi(v) == 1; }();
         const bool ckpt_check = std::getenv("STRATA_CKPT_STAGE_CHECK") != nullptr;
         const bool ckpt_detail = std::getenv("STRATA_CKPT_DETAIL") != nullptr;
@@ -7866,7 +7907,8 @@ int main(int argc, char **argv) try {
             c.used = ++check_clock;
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
                 const int64_t old_tail = tail_ckpt_len;
-                checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
+                if (ckpt_pool.on()) ckpt_pool.erase_if(checks, [&](const ConvCheckpoint& k) { return old_tail >= 0 && (int64_t)k.ids.size() == old_tail; });
+                else checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
                                  return old_tail >= 0 && (int64_t) k.ids.size() == old_tail;
                              }), checks.end());
                 tail_ckpt_len = L;
@@ -7887,6 +7929,7 @@ int main(int argc, char **argv) try {
                 for (size_t i = 0; i < is_tail.size(); ++i) tail_flags[i] = is_tail[i] != 0;
                 const size_t victim = strata::program::conv_cache::eviction_victim(
                     stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get());
+                ckpt_pool.give(std::move(checks[victim]));
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
             if (ckpt_detail) std::fprintf(stderr, "strata ckpt detail keep tokens=%lld before=%zu after=%zu ms=%.4f\n", (long long)L,count_before,checks.size(),std::chrono::duration<double,std::milli>(Clock::now()-kt0).count());
@@ -7913,7 +7956,7 @@ int main(int argc, char **argv) try {
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
                     return true;
                 }
-            ConvCheckpoint c;
+            ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
             if (parts != nullptr) {
@@ -7932,9 +7975,9 @@ int main(int argc, char **argv) try {
                 if (ckpt_detail) std::fprintf(stderr, "strata ckpt detail syncstage tokens=%lld sync_ms=%.4f copy_ms=%.4f\n", (long long)L,std::chrono::duration<double,std::milli>(sync_end-t0).count(),std::chrono::duration<double,std::milli>(Clock::now()-sync_end).count());
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 if (ckpt_check) {
-                    ConvCheckpoint ref, staged; ref.ids = c.ids; staged.ids = c.ids;
-                    if (!checkpoint_save(ref, ss, g) || !strata::core::conversation_checkpoint_unstage(staged, ckpt_buffer.get(), ss, g, ckpt_why)) return false;
-                    if (ref.gdn != staged.gdn || ref.ple != staged.ple || ref.tails != staged.tails || ref.dead != staged.dead || ref.block_pos != staged.block_pos) { ckpt_why = "staged payload differs"; return false; }
+                    ConvCheckpoint ref; ref.ids = c.ids;
+                    if (!checkpoint_save(ref, ss, g) || !strata::core::conversation_checkpoint_unstage(c, ckpt_buffer.get(), ss, g, ckpt_why)) return false;
+                    if (ref.gdn != c.gdn || ref.ple != c.ple || ref.tails != c.tails || ref.dead != c.dead || ref.block_pos != c.block_pos) { ckpt_why = "staged payload differs"; return false; }
                     std::fprintf(stderr, "strata checkpoint payload EXACT tokens=%lld\n", (long long)L);
                 }
                 if (ckpt_timing) std::fprintf(stderr, "strata checkpoint save mode=stage tokens=%lld ms=%.3f\n", (long long)L, ms);
@@ -7945,6 +7988,12 @@ int main(int argc, char **argv) try {
                 if (!gpu_sync_ok()) return false;
                 const auto sync_end = ckpt_detail ? Clock::now() : Clock::time_point{};
                 if (!checkpoint_save(c, ss, g)) return false;
+                if (ckpt_check && ckpt_pool.on()) {
+                    ConvCheckpoint ref; ref.ids = c.ids;
+                    if (!checkpoint_save(ref, ss, g)) return false;
+                    if (ref.gdn != c.gdn || ref.ple != c.ple || ref.tails != c.tails || ref.dead != c.dead || ref.block_pos != c.block_pos) { ckpt_why = "pooled payload differs"; return false; }
+                    std::fprintf(stderr, "strata checkpoint pool payload EXACT tokens=%lld\n", (long long)L);
+                }
                 if (ckpt_detail) std::fprintf(stderr, "strata ckpt detail sync tokens=%lld ms=%.4f\n", (long long)L,std::chrono::duration<double,std::milli>(sync_end-t0).count());
                 if (ckpt_timing) std::fprintf(stderr, "strata checkpoint save mode=baseline tokens=%lld ms=%.3f\n", (long long)L, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
@@ -10110,7 +10159,8 @@ int main(int argc, char **argv) try {
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
-            checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
+            if (ckpt_pool.on()) ckpt_pool.erase_if(checks, [&](const ConvCheckpoint& c) { return (int64_t)c.ids.size() > resume || !starts_with(c.ids,c.imgs); });
+            else checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
                              return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
