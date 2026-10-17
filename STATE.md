@@ -18,3 +18,5 @@ Erledigt:1.45 live, Health geladen, neuer Server-CWD/Config/Engine-Hash geprüft
 Naechster Schritt: Normalbetrieb auf1.45; kein weiterer Test geplant.
 
 Auftrag: Optionales Checkpoint-Staging portieren und B70-Gewinn prüfen. Backups im Auftrag-Workspace work/checkpoint-backup. Opt-in-Pfad mit Payload-Vergleich und Timing implementiert; Default unverändert. Nächster Schritt: Build, dann kontrollierter Vergleich mit Restore.
+
+Erledigt: Build erfolgreich;1bd1a20. Q-Arm auf B70: vier Turn-Checkpoints bytegenau identisch zur bisherigen Sicherung, Folgeanfragen erfolgreich. Staging4,5–4,9ms; noch kein Vergleichsergebnis. ABBA-Timing läuft unter results/short_prefill_20261017_155538. Nächster Schritt: A/B abschliessen und Produktion restaurieren.
