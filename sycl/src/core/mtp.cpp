@@ -744,6 +744,10 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
         std::vector<uint8_t> raw;
         if (read_file(vocab_file(), raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
+            for (size_t i = 0; i < raw.size(); i += 4) {
+                int32_t token; std::memcpy(&token, raw.data() + i, 4);
+                if (token < 0 || token >= n_vocab_) { err = "mtp: draft vocabulary token out of range"; return false; }
+            }
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
             if (DPCT_CHECK_ERROR(dvocab_ = (int32_t *)sycl::malloc_device(
                                      raw.size(), dpct::get_in_order_queue())) !=
@@ -770,7 +774,8 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
                     planar_gathered = true;
                 }
             }
-            if (!planar_gathered)
+            if (!planar_gathered && !strata::kernels::native_q6_k_gather_packed_rows(
+                    head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr))
                 strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             dpct::get_current_device().queues_wait_and_throw();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();

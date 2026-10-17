@@ -753,8 +753,7 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp64});

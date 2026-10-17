@@ -5,6 +5,9 @@
 #include "strata/sycl_queue.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/gdn_xe.hpp"
+#if defined(STRATA_INTEL_GDN)
+#include "intel_gdn/intel_gdn.hpp"   // opt-in Intel delta stage (README_gdn.md)
+#endif
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -1663,6 +1666,33 @@ auto &wsum = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[4]>(
     y16[(size_t) t * ld16 + (size_t) head * S + col] = hf(v);   // (the FP32 normalized value is not stored: nothing reads it)
 }
 
+// gdn_out_norm_kernel for the Intel delta arm (README_gdn.md, Runde 3 Aufgabe 5): reads the kernel's
+// FP16 output iout [T,HV,S] (Intel head numbering, per-slot offset via hvoff=perm_h2i) instead of the
+// FP32 y copy. The FP32 y carried no extra bits (the delta kernel wrote FP16), z/gamma/y16 stay in
+// Strata slot order, the norm math and hf() rounding are identical -> y16 bit-identical to the chain
+// kernel->out_write->norm. Window guard: md5 equality with STRATA_IQ_MT_MIN=1 (A/B: STRATA_GDN_INTEL_OUTWR=1).
+__dpct_inline__ void gdn_out_norm_intel_kernel(const float *__restrict__ z,
+                                               const float *__restrict__ gamma,
+                                               float eps, const sycl::half *__restrict__ iout,
+                                               const int *__restrict__ hvoff,
+                                               uint16_t *__restrict__ y16,
+                                               int64_t ld16) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto &wsum = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[4]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int64_t t = item_ct1.get_group(2);
+    const int head = item_ct1.get_group(1), col = item_ct1.get_local_id(2);
+    const size_t at = (size_t) t * HV * S + (size_t) hvoff[head] * S + col;
+    const float oc = (float) iout[at];
+    float sp = warp_sum(oc * oc);
+    if ((col & 31) == 0) wsum[col >> 5] = sp;
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+    const float v = oc * sycl::rsqrt(ss / (float)S + eps) * gamma[col] *
+                    sigm(z[t * HV * S + head * S + col]);
+    y16[(size_t) t * ld16 + (size_t) head * S + col] = hf(v);
+}
+
 // ---------------------------------------------------------------- MoE
 template <int REG>
 /*
@@ -2174,8 +2204,7 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
     static const bool wide_env = [] { const char* v = std::getenv("STRATA_KV_WIDE_HOST"); return !(v && v[0] == '0'); }();
     const bool wide = wide_env;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -2219,8 +2248,7 @@ void set_act_f16(bool on) {
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class to_f16_kernel_c8575f>>(
@@ -2239,8 +2267,7 @@ void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
 void round_f16(const float* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class round_f16_kernel_877aa1>>(
@@ -2259,8 +2286,7 @@ void round_f16(const float* x, float* y, int64_t n, void* stream) {
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class to_bf16_kernel_44d81a>>(
@@ -2280,8 +2306,7 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream,
              uint16_t* xn16_lo, bool /*f16img: the Turing FP16 image of xn16 (CUDA only)*/) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gr_norm_kernel_f38542>>(
@@ -2299,8 +2324,7 @@ void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream,
                 uint16_t* xn16_lo, int64_t ldx, bool /*f16img*/) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -2324,8 +2348,7 @@ void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint1
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
               int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gr_mix_r_kernel_a64dc1>>(
@@ -2363,8 +2386,7 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx,
                       bool /*f16img*/) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -2390,8 +2412,7 @@ void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t 
                            const float* s_l, const int* on, int mode, const float* w_norm_next, float eps, float* rs,
                            uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool /*f16img*/) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -2416,8 +2437,7 @@ void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t 
 }
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -2437,8 +2457,7 @@ void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t*
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
             uint16_t* mixed_h, uint16_t* mixed16_lo) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gr_mix_kernel_d9dd98>>(
@@ -2454,8 +2473,7 @@ void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16
 }
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gr_write_kernel_b96cec>>(
@@ -2470,8 +2488,7 @@ void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64
 }
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gr_broadcast_kernel_3dedc6>>(
@@ -2486,8 +2503,7 @@ void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
 }
 void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_gates_kernel_e66d35>>(
@@ -2503,8 +2519,7 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream) {
     static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
     if (serial || T <= CONV_TILE) {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_conv_kernel_df787b>>(
@@ -2518,8 +2533,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
         static const bool fused = [] { const char* v = std::getenv("STRATA_GDN_CONVL2"); return v && std::atoi(v) != 0; }();
         if (fused) {
             {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 strata::q_of(stream)
                     ->parallel_for<
@@ -2538,8 +2552,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
                             });
             }
             {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 strata::q_of(stream)
                     ->parallel_for<
@@ -2555,8 +2568,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
             return;
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->parallel_for<
@@ -2572,8 +2584,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
                     });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->parallel_for<
@@ -2587,8 +2598,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
         }
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_l2_kernel_d82250>>(
@@ -2624,7 +2634,7 @@ static bool gdn_xe_on(void* stream) {
 }
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
-                            void* stream, int64_t ld16) {
+                            void* stream, int64_t ld16, const float* ab, const float* dt, const float* ssm_a) {
     if (ld16 <= 0) ld16 = (int64_t) HV * S;
 #if defined(__HIPCC__)
     if (variant == 3) {   // diagnostics: the quad recurrence + the old norm kernel
@@ -2669,18 +2679,33 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 #else
     (void) variant;   // the quad recurrence kernels are AMD-only
 #endif
+    // variant 9 (STRATA_GDN_INTEL=1, README_gdn.md): Intel's chunk_gated_delta_rule_xe2 on the raw gates. It writes
+    // y (FP32, Strata slot order) itself; the norm kernel below is untouched. On any unsupported shape or failed
+    // launch the variant-6 kernel takes over unchanged.
+    bool intel_done = false;
+    bool intel_norm = false;
+#if defined(STRATA_INTEL_GDN)
+    static strata_intel_gdn::Scratch ig;   // the recurrence runs sequentially per layer, one scratch is enough
+    if (variant == 9 && ab && dt && ssm_a) {
+        // Runde 3 Aufgabe 5: ohne den out_write-Durchzug — das norm below liesst Intels fp16 iout direkt
+        // (hvoff-Tabelle, identische Rundung). A/B-Fallback unters Fenster: STRATA_GDN_INTEL_OUTWR=1.
+        static const bool old_out = [] { const char* v = std::getenv("STRATA_GDN_INTEL_OUTWR"); return v != nullptr && std::atoi(v) != 0; }();
+        intel_norm = !old_out;
+        intel_done = strata_intel_gdn::run(*strata::q_of(stream), ig, h, ab, dt, ssm_a, state, y, T, S, HK, HV,
+                                           false, intel_norm);
+    }
+#endif
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
     // variant 6 = the Xe sub-group recurrence + the unchanged norm kernel (gdn_recurrence: gdn_xe_on)
-    const bool xe = T > 0 && !serial && variant == 6;
+    const bool xe = T > 0 && !serial && (variant == 6 || (variant == 9 && !intel_done));
     if (xe && !gdn_xe_device(stream)) throw std::runtime_error("GDN Xe variant requires an Intel GPU with 16-lane sub-groups");
-    if (!xe && (serial || T <= 0 || variant == 2)) {
+    if (!intel_done && !xe && (serial || T <= 0 || variant == 2)) {
         /*
         DPCT1049: The work-group size passed to the SYCL kernel may exceed
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_rec_kernel_923fed>>(
@@ -2694,14 +2719,17 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
                     });
     } else {
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
+        if (intel_done) {
+            // Intel arm ran; with intel_norm it wrote only fp16 iout — the norm variant below reads it
+            // directly (no out_write pass, no fp32 y). Without intel_norm: y is written, old norm below.
+        } else
         if (xe) {
             detail::gdn_xe_launch(*strata::q_of(stream), state, h, gate, beta, y, T);
         } else
 #if !defined(__HIPCC__)
         if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->parallel_for<
@@ -2716,8 +2744,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 #endif
             if (pipe) // the software-pipelined loads (same bits)
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->parallel_for<
@@ -2729,8 +2756,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
                         gdn_rec_cols_pipe_kernel(state, h, gate, beta, y, T);
                     });
         } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->parallel_for<
@@ -2743,9 +2769,25 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
                     });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+#if defined(STRATA_INTEL_GDN)
+            if (intel_done && intel_norm) {   // Intel arm: norm reads the kernel's fp16 iout (no out_write pass)
+                const sycl::half* iop = (const sycl::half*)ig.iout;
+                const int* hov = ig.hvoff;
+                strata::q_of(stream)
+                    ->parallel_for<
+                        dpct_kernel_name<class gdn_out_norm_intel_kernel_43e92c>>(
+                        sycl::nd_range<3>(sycl::range(1, HV, (unsigned)T) *
+                                              sycl::range(1, 1, S),
+                                          sycl::range(1, 1, S)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                gdn_out_norm_intel_kernel(z, gamma, eps, iop, hov, y16,
+                                                          ld16);
+                            });
+            } else
+#endif
             strata::q_of(stream)
                 ->parallel_for<
                     dpct_kernel_name<class gdn_out_norm_kernel_43e92c>>(
@@ -2762,20 +2804,29 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
     check("gdn_recurrence");
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t ld16) {
+                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t ld16,
+                    const float* ab, const float* dt, const float* ssm_a) {
     // Aurora (S23): four lanes per column + the grid-stride norm, the same bits (tests/hip/gdn_rec_head.cpp);
     // STRATA_GDN_HEAD=1 (on by default on gfx1151; off with STRATA_GDN_HEAD=0 or STRATA_GDN_REC_HEADS) takes them
     // (AMD builds only; the arch defaults set STRATA_GDN_HEAD=1 on gfx1151 and leave other cards on the earlier kernels)
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
-    const int v = head && !serial ? 1 : (!serial && gdn_xe_on(stream)) ? 6 : 0;
-    gdn_recurrence_variant(v, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16);
+#if defined(STRATA_INTEL_GDN)
+    // opt-in Intel delta stage (README_gdn.md): STRATA_GDN_INTEL=1 wins over the Xe variant; without the raw-gate
+    // arguments (older callers) it stays off, and a failed run falls back to variant 6 inside gdn_recurrence_variant
+    static const bool intel_on = [] { const char* v = std::getenv("STRATA_GDN_INTEL"); return v != nullptr && std::atoi(v) != 0; }();
+#endif
+    const int v =
+#if defined(STRATA_INTEL_GDN)
+        intel_on && !serial && ab && dt && ssm_a ? 9 :
+#endif
+        head && !serial ? 1 : (!serial && gdn_xe_on(stream)) ? 6 : 0;
+    gdn_recurrence_variant(v, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, ab, dt, ssm_a);
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class route_kernel_ceb296,
@@ -2790,8 +2841,7 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
                     });
     } else if (n_expert == 256)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class route_kernel_4c3133,
@@ -2810,8 +2860,7 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class blob_dequant_kernel_252bb1,
@@ -2828,8 +2877,7 @@ void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* s
 }
 void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class blob_dequant_kernel_1d812a,
@@ -2847,8 +2895,7 @@ void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, voi
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class swiglu_il_kernel_98d495>>(
@@ -2863,8 +2910,7 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
 }
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class swiglu_pair_kernel_ab28da>>(
@@ -2909,8 +2955,7 @@ void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     const int64_t n4 = n / 4, b = std::min<int64_t>((n4 + 255) / 256, 4096);
     if (n4 > 0) {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class copy_f4_kernel_bb4110>>(
@@ -2929,8 +2974,7 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
     const int64_t b = (n + 255) / 256;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class copy_i32_kernel_1c95ea>>(
@@ -2947,8 +2991,7 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream) {
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gather_rows16_kernel_d9d697>>(
@@ -2968,8 +3011,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
 #ifndef STRATA_W_NO_COMB
     if (((reinterpret_cast<uintptr_t>(Dm) | reinterpret_cast<uintptr_t>(shared) | reinterpret_cast<uintptr_t>(bo)) & 15) == 0) {
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             strata::q_of(stream)
                 ->parallel_for<
@@ -2990,8 +3032,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
     }
 #endif
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class moe_combine_kernel_60f865>>(
@@ -3007,8 +3048,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class rms_rows_kernel_c88408>>(
@@ -3036,8 +3076,7 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
     const strata::kernels::RopeTab rt = strata::kernels::rope_table_for(scaling);
     if (rt.cos != nullptr)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -3057,8 +3096,7 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
                     });
             });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -3082,8 +3120,7 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class split_q_kernel_83c16c>>(
@@ -3098,8 +3135,7 @@ void split_q(const float* q_full, float* q, int64_t T, void* stream) {
 }
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, int64_t ld16) {
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {

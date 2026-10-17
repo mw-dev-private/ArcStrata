@@ -159,8 +159,7 @@ void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_
     const dpct::dim3 grid((unsigned)s.n_head_kv,
                           (unsigned)(s.head_dim / KV_Q8_GROUP), 2);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -199,8 +198,7 @@ void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v
                           (unsigned)(s.head_dim / KV_Q8_GROUP),
                           (unsigned)(2 * n_tok));
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -234,8 +232,7 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
     const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
     const unsigned blocks = (unsigned) ((total + 255) / 256);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class kv_gather_q8_kernel_84cbb3>>(

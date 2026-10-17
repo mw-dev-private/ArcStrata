@@ -587,7 +587,7 @@ def pin_billing_stamp(system: str) -> str:
     return "".join(s)
 
 
-def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
+def anthropic_to_messages(req: dict, think_unasked: bool = True, honor_budget: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
     renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
@@ -640,7 +640,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     # 0.1.45: Anthropic's budget_tokens is a real budget, not only a level: the thinking is closed (wrap-up, </think>,
     # the answer) after that many tokens.  A reasoning_budget_tokens of the request's own wins.
     bt = thinking.get("budget_tokens") if isinstance(thinking, dict) and thinking.get("type") != "disabled" else None
-    if isinstance(bt, int) and not isinstance(bt, bool) and bt > 0 and req.get("reasoning_budget_tokens") is None:
+    if honor_budget and isinstance(bt, int) and not isinstance(bt, bool) and bt > 0 and req.get("reasoning_budget_tokens") is None:
         req["reasoning_budget_tokens"] = bt
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
         kwargs["enable_thinking"] = False

@@ -79,5 +79,10 @@ void qsa_decode_attn_merge_only(const int32_t* steps, int64_t cap, const QsaShap
 /// over rows.p[z] - one launch instead of one per query, the same per-query arithmetic (bit-identical outputs).
 void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids, const int32_t* steps,
                                 int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+/// SYCL prompt fallback entry: explicit phase lets QSA_PREFILL and QSA_DECODE be controlled independently.
+#if defined(SYCL_LANGUAGE_VERSION)
+void qsa_prefill_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+#endif
 
 }  // namespace strata::kernels

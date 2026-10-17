@@ -4,6 +4,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/tail_skip_policy.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -2544,6 +2545,23 @@ constexpr int64_t kMaxWindowEntries = 128;
 static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 
+namespace {
+// STRATA_ROUTE_TAIL_SKIP: the rank from which a missed expert that every token of the window routes that low is skipped.  An
+// Explicit environment values are read once. SYCL never sets an automatic default.
+std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
+}  // namespace
+int tail_skip_rank() {
+    int r = g_tail_skip_rank.load(std::memory_order_relaxed);
+    if (r < 0) {
+        const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP");
+        r = v != nullptr ? std::atoi(v) : 0;
+        r = r > 0 && r < 10 ? r : 0;
+        g_tail_skip_rank.store(r, std::memory_order_relaxed);
+    }
+    return r;
+}
+void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -2605,6 +2623,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
+        // Evaluate distinct misses before assigning the PCIe share. No weights are changed.
+        const int tail_rank = tail_skip_rank();
+        bool skip_d[kMaxWindowEntries] = {};
+        if (tail_rank > 0 && d.tail_skip_allowed && d.peer == nullptr && d.remote_count == 0) {
+            for (int q = 0; q < nd; ++q) {
+                const int32_t e = ids[distinct[q]];
+                if (e < 0 || e >= d.n_expert) continue;
+                const bool resident = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0;
+                if (!tail_skip_candidate(ids, n_tok, k, e, resident, tail_rank)) continue;
+                skip_d[q] = true;
+                --nmiss;
+                ++d.tail_experts;
+            }
+        }
         const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
@@ -2616,6 +2648,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int32_t e = ids[i0];
             int kd = -1;
             unsigned long long ptr = 0;
+            if (skip_d[q]) {
+                for (int64_t i = i0; i < n; ++i)
+                    if (first_of[i] == i0) kind[i] = -2;
+                continue;
+            }
             if (e >= 0 && e < d.n_expert) {
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
                 if (slot >= 0) {
@@ -2710,7 +2747,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
     bool any_cpu = false;
     for (int64_t i = 0; i < n; ++i)
-        if (kind[i] < 0) { any_cpu = true; break; }
+        if (kind[i] == -1) { any_cpu = true; break; }
     const auto c1 = std::chrono::steady_clock::now();
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
@@ -2730,7 +2767,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         static thread_local std::vector<int64_t> miss;
         miss.clear();
         for (int64_t i = 0; i < n_tok * k; ++i)
-            if (kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
+            if (kind[i] == -1 && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
@@ -2747,6 +2784,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_layer = d.layers;
                 d.fail_expert = e;
                 return;
+            }
+            if (kind[i] == -2) {
+                std::memset(row, 0, (size_t) H * sizeof(float));
+                ++d.tail_skipped;
+                continue;
             }
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;

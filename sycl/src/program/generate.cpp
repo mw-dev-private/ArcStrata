@@ -31,12 +31,14 @@
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/prefill_refill.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gguf_expert_source.hpp"
+#include "strata/prefill/share_rules.hpp"
 namespace strata::prefill { void set_nonresident_share(double share); }   // SYCL port: prefill.cpp
 #include "strata/kernels/resident_plan_mirror.hpp"
 #include "strata/core/pinned.hpp"
@@ -4418,7 +4420,19 @@ int main(int argc, char **argv) try {
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; `pf_borrow` is
         // the predicate a local `borrow` was here, hoisted above so both cache-size branches read the same one)
-        const int64_t prefill_mib = owned_prefill_mib();
+        int64_t prefill_mib = owned_prefill_mib();
+        // STRATA_GDN_INTEL=1 (README_gdn.md): the Intel delta stage allocates its scratch (q/k/v padding, out, A/w/u: ~63.9 KB per padded
+        // token, ~1.05 GB for a 16384-token chunk) on the first chunk - reserve it here, or the expert cache takes the space and the
+        // first chunk dies with UR_RESULT_ERROR_OUT_OF_RESOURCES (window 14.10.).
+        if (const char* gi = std::getenv("STRATA_GDN_INTEL"); gi != nullptr && std::atoi(gi) != 0 && o.prefill_chunk > 0) {
+            // one-shot generate: no prompt ever runs past its own token count, so the auto ceiling
+            // (--prefill auto:32768 -> 2064 MiB) can be capped to the prompt; serve keeps the ceiling
+            const int64_t chunk = o.serve ? o.prefill_chunk : std::min(o.prefill_chunk, (int64_t) o.tokens.size());
+            const int64_t tp = (chunk + 63) / 64 * 64 + 64;   // padded tokens + the wrapper's max padding (63)
+            const int64_t gdn_mib = (tp * 63872 + (1 << 20) - 1) / (1 << 20) + 64;
+            std::fprintf(stderr, "strata generate: STRATA_GDN_INTEL: reserving %lld MiB for the Intel delta stage's scratch\n", (long long) gdn_mib);
+            prefill_mib += gdn_mib;
+        }
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
         int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
@@ -5980,6 +5994,37 @@ int main(int argc, char **argv) try {
         std::fprintf(stderr, "strata generate: token graph captured (48 layers, one launch per token)\n");
     }
 
+    // SYCL is opt-in only. Explicit requests are also gated for batch, peer/helper and NVFP4.
+    auto configure_tail_skip = [&] {
+        const int requested = strata::core::tail_skip_rank();
+        if (requested == 0) return;  // Unset/zero retains the original path and logging.
+        bool nvfp4 = false;
+        if (native_pack)
+            for (const auto& f : strata::kernels::cpu::expert_layout().fmt)
+                nvfp4 = nvfp4 || f.gu_type == strata::kernels::cpu::kNvfp4Type ||
+                                  f.d_type == strata::kernels::cpu::kNvfp4Type;
+        size_t cached = 0;
+        for (int32_t r : host_res) cached += r >= 0;
+        const char* mcs = std::getenv("STRATA_TAIL_SKIP_MAX_CACHED");
+        const double max_cached = mcs && *mcs ? std::atof(mcs) : 90.0;
+        const char* reason = nullptr;
+        if (o.batch != 0) reason = "batch slots mix requests";
+        else if (o.peer_device >= 0 || drive.d.peer != nullptr || drive.d.remote_count > 0) reason = "peer/helper GPU";
+        else if (nvfp4) reason = "NVFP4 experts";
+        else if (host_res.empty()) reason = "no static residency table";
+        else if (cached == host_res.size()) reason = "all experts resident";
+        else if (100.0 * cached >= max_cached * host_res.size()) reason = "cached share reaches STRATA_TAIL_SKIP_MAX_CACHED";
+        if (reason) {
+            strata::core::set_tail_skip_rank(0);
+            std::fprintf(stderr, "strata: STRATA_ROUTE_TAIL_SKIP=%d disabled: %s\n", requested, reason);
+            return;
+        }
+        drive.d.tail_skip_allowed = true;
+        std::fprintf(stderr, "strata: STRATA_ROUTE_TAIL_SKIP=%d is ON (SYCL opt-in, %.1f%% cached, limit %.1f%%): "
+                             "missed tail experts contribute zero; weights unchanged; answers may differ\n",
+                     requested, 100.0 * cached / host_res.size(), max_cached);
+    };
+
     // ================================ WHERE THE HOST TERM GOES, PER TOKEN ================================
     //
     // **`--gpu-only-full` MEASURES THE 48 LAYER GRAPHS AND THE LM HEAD AND NOTHING ELSE.**  It never enters
@@ -6585,6 +6630,37 @@ int main(int argc, char **argv) try {
 #endif
     }
     if (o.adapt_async && !src.complement_ready()) adapt_async_off("the resident RAM mode is not running");
+    // 0.1.42 (H11), ported: the CPU prefill share is armed only when the host has the memory for it.  One line says
+    // why not; an explicit STRATA_PREFILL_CPU_SHARE (other than 0) is kept anyway, with a warning when memory is short.
+    const char* share_env = std::getenv("STRATA_PREFILL_CPU_SHARE");
+    const bool share_requested = share_env && (std::strcmp(share_env, "auto") == 0 || std::atof(share_env) > 0.0);
+    auto share_default_ok = [&]() -> bool {
+        strata::prefill::share_rules::ShareMemory sm;
+        strata::core::detail::HostMemory hm;
+        if (strata::core::detail::host_available_memory(hm)) {
+            sm.avail_ram = hm.available;
+            sm.avail_commit = hm.commit == ~uint64_t{0} ? strata::prefill::share_rules::kUnknown : hm.commit;
+        }
+        sm.buffer_bytes = (uint64_t) (1024 + 8 * g.n_expert) * (uint64_t) g.n_embd * 4 + (256ull << 20);
+        if (srcp == &src) {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (xcache.slot_of(l, e) < 0 && src.resident_blob(l, e) == nullptr && !src.transient(l, e))
+                        sm.inplace_bytes += (uint64_t) lay.blob_bytes(l);
+        }
+        const auto v = strata::prefill::share_rules::default_share_memory_verdict(sm);
+        if (v.arm) return true;
+        const char* ev = std::getenv("STRATA_PREFILL_CPU_SHARE");
+        if (ev == nullptr)
+            std::fprintf(stderr, "strata: the CPU prefill share is not armed by default: %s. STRATA_PREFILL_CPU_SHARE=auto "
+                                 "turns it on anyway\n", v.why.c_str());
+        else if (std::strcmp(ev, "0") != 0)
+            std::fprintf(stderr, "strata: WARNING STRATA_PREFILL_CPU_SHARE=%s is set and kept, but %s: the share can slow "
+                                 "prompts or fail on a machine this short of memory (STRATA_PREFILL_CPU_SHARE=0 turns it off)\n",
+                         ev, v.why.c_str());
+        return false;
+    };
     if (o.serve) {
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
@@ -6599,6 +6675,18 @@ int main(int argc, char **argv) try {
         // confirms every emitted token against the real model regardless of where the draft came from.
         const bool use_mtp = !o.mtp.empty();
         strata::prefill::Prefill sp;
+        // the pool is idle while a prompt is read unless batch slots decode between its parts; with
+        // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it).
+        // SYCL port: arm_cpu_share's by_default stays false - unset STRATA_PREFILL_CPU_SHARE is OFF on this port.
+        const bool share_pool = share_requested && o.batch <= 0 && !o.no_pool;
+        bool share_has_work = strata::prefill::share_rules::default_share_has_work(
+            (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
+        if (share_requested && !share_has_work)
+            std::fprintf(stderr, "strata serve: every expert is in the GPU cache (%lld of %lld): the CPU prefill share has "
+                                 "nothing to take, so it is not armed by default (STRATA_PREFILL_CPU_SHARE=auto forces it)\n",
+                         (long long) xcache.slots(), (long long) (g.n_layers * g.n_expert));
+        if (share_pool && stages.empty() && !multi_gpu && share_has_work && !share_default_ok()) share_has_work = false;   // H11
+        strata::prefill::Prefill::arm_cpu_share(share_pool, false);
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -6913,6 +7001,7 @@ int main(int argc, char **argv) try {
                     sb = st.cache.device_slot(pf_parts[i + 1].first);
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
+                if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
                                 err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
@@ -6920,6 +7009,7 @@ int main(int argc, char **argv) try {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+            if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
@@ -7882,6 +7972,7 @@ int main(int argc, char **argv) try {
             }
         }
         drive.d.plan = ver.plan_sink();
+        configure_tail_skip();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         const bool all_experts_resident = !host_res.empty() &&
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
@@ -10239,17 +10330,23 @@ int main(int argc, char **argv) try {
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
+                std::unique_ptr<strata::core::PrefillRefillBatch> async_refill;
+                if (strata::core::prefill_refill_async_enabled() && !refill_blocking())
+                    async_refill = std::make_unique<strata::core::PrefillRefillBatch>(
+                        (size_t) strata::kernels::cpu::expert_layout().max_blob);
                 size_t queued = 0;
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                    const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
+                    const uint8_t* b = async_refill ? nullptr : srcp->blob(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                    if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
-                                                            : p.cache->fill_slot_queued(slot, b, e, nb)))
+                    if ((!async_refill && b == nullptr) || !(async_refill ? async_refill->push(*p.cache, slot, *srcp, i / g.n_expert, i % g.n_expert, (size_t) nb, e)
+                                         : refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
+                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
                     host_res[(size_t) i] = slot;
                     // SYCL port: drain before GgufExpertSource's 512-buffer blob ring can wrap onto a queued copy
-                    if (!refill_blocking() && ++queued % 256 == 0 && !p.cache->sync_queued(e)) return false;
+                    if (!async_refill && !refill_blocking() && ++queued % 256 == 0 && !p.cache->sync_queued(e)) return false;
                 }
+                if (async_refill && !async_refill->finish(e)) return false;
                 return true;
             };
             auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
@@ -11733,6 +11830,9 @@ int main(int argc, char **argv) try {
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
             // raises the hit rate while the PCIe reads may make the decode slower)
+            if (drive.d.tail_experts > 0)
+                std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since start\n",
+                             (long long) drive.d.tail_experts, (long long) drive.d.tail_skipped);
             if (req_look > 0) {
                 char off[160] = "";
                 if (req_offload > 0)
@@ -11834,6 +11934,11 @@ int main(int argc, char **argv) try {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
+    // SYCL port: by_default stays false (unset STRATA_PREFILL_CPU_SHARE is OFF on this port); the RAM verdict still
+    // warns when an explicit share runs on a host that is short of memory.  Before the chunk below sizes the loan.
+    if (share_requested && !multi_gpu && !o.no_pool)
+        (void) share_default_ok();   // H11: prints the warning when the explicit share and this host's RAM disagree
+    strata::prefill::Prefill::arm_cpu_share(share_requested && !multi_gpu && !o.no_pool, false);
     bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
@@ -11882,6 +11987,7 @@ int main(int argc, char **argv) try {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
+        if (share_requested && !multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {
@@ -11915,12 +12021,17 @@ int main(int argc, char **argv) try {
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
+            std::unique_ptr<strata::core::PrefillRefillBatch> async_refill;
+            if (strata::core::prefill_refill_async_enabled() && !refill_blocking())
+                async_refill = std::make_unique<strata::core::PrefillRefillBatch>(
+                    (size_t) strata::kernels::cpu::expert_layout().max_blob);
             size_t queued = 0;
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
+                const uint8_t* b = async_refill ? nullptr : srcp->blob(i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
-                                                        : xcache.fill_slot_queued(slot, b, err, nb))) {
+                if ((!async_refill && b == nullptr) || !(async_refill ? async_refill->push(xcache, slot, *srcp, i / g.n_expert, i % g.n_expert, (size_t) nb, err)
+                                     : refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
+                                                         : xcache.fill_slot_queued(slot, b, err, nb))) {
                     std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -11928,10 +12039,14 @@ int main(int argc, char **argv) try {
                 // SYCL port: GgufExpertSource::blob() hands out a ring of 512 buffers, valid until the next blob()
                 // call; a queued copy reads its buffer later, so drain before the ring can wrap onto one (938 lent
                 // slots refilled through 512 buffers gave ~426 slots another expert's bytes)
-                if (!refill_blocking() && ++queued % 256 == 0 && !xcache.sync_queued(err)) {
+                if (!async_refill && !refill_blocking() && ++queued % 256 == 0 && !xcache.sync_queued(err)) {
                     std::fprintf(stderr, "strata generate: refilling the lent slots failed: %s\n", err.c_str());
                     return 1;
                 }
+            }
+            if (async_refill && !async_refill->finish(err)) {
+                std::fprintf(stderr, "strata generate: async refill failed: %s\n", err.c_str());
+                return 1;
             }
             if (!xcache.sync_queued(err)) {
                 std::fprintf(stderr, "strata generate: refilling the lent slots failed: %s\n", err.c_str());
@@ -11953,6 +12068,9 @@ int main(int argc, char **argv) try {
         ss.ple_prev[0] = pos_start >= 2 ? (int32_t) o.tokens[(size_t) (pos_start - 2)] : -1;
         ss.ple_prev[1] = pos_start >= 1 ? (int32_t) o.tokens[(size_t) (pos_start - 1)] : -1;
         const strata::prefill::PrefillStats& ps = prefill.stats();
+        if (share_requested)
+            std::fprintf(stderr, "prefill CPU share: requested %s, %lld expert groups computed on CPU, last share %.4f\n",
+                         share_env, (long long) ps.experts_cpu, ps.cpu_share);
         std::fprintf(stderr, "strata generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
                              "streamed %lld (%lld by DMA, host %.1f ms), resident %lld; PLE %.1f ms\n",
                      (long long) ps.tokens, (long long) ps.chunks, ps.ms_total,
@@ -12299,6 +12417,7 @@ int main(int argc, char **argv) try {
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         drive.d.plan = ver.plan_sink();
+        configure_tail_skip();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
@@ -12628,6 +12747,27 @@ int main(int argc, char **argv) try {
                     if (f) std::fclose(f);
                 }
             }
+            // Offline quality window: full logits only for emitted rows on a fixed continuation.
+            if (const char* path = std::getenv("STRATA_TAIL_KL_LOGITS")) {
+                if (follow.empty()) {
+                    std::fprintf(stderr, "STRATA_TAIL_KL_LOGITS requires --spec-follow\n");
+                    return 1;
+                }
+                std::FILE* f = std::fopen(path, produced.empty() ? "wb" : "ab");
+                if (!f) { std::fprintf(stderr, "cannot open tail KL logits\n"); return 1; }
+                std::vector<float> row((size_t) ver.vocab());
+                bool ok = true;
+                for (int i = 0; i <= a && (int64_t) produced.size() + i < max_new; ++i) {
+                    const uint64_t position = produced.size() + (size_t) i;
+                    const int32_t vocab = (int32_t) ver.vocab();
+                    if (!ver.copy_logits(i, row.data()) ||
+                        std::fwrite(&position, sizeof(position), 1, f) != 1 ||
+                        std::fwrite(&vocab, sizeof(vocab), 1, f) != 1 ||
+                        std::fwrite(row.data(), sizeof(float), row.size(), f) != row.size()) { ok = false; break; }
+                }
+                if (std::fclose(f) != 0) ok = false;
+                if (!ok) { std::fprintf(stderr, "cannot write tail KL logits\n"); return 1; }
+            }
             // plan v0.3 P6: the adaptive tier's host work (ranking, copy submission) runs on its own thread while the
             // GPU commits and drafts; it touches only the residency tables, which nothing reads until the next window
             std::thread adapt_thr;
@@ -12711,6 +12851,9 @@ int main(int argc, char **argv) try {
                         ver.ms_commit / rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
+        if (drive.d.tail_experts > 0)
+            std::printf("route tail skip: %lld missed experts skipped (%lld entries)\n",
+                        (long long) drive.d.tail_experts, (long long) drive.d.tail_skipped);
         if (rounds > 0)
             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
                         "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,

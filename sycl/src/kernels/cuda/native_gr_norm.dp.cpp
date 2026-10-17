@@ -116,8 +116,7 @@ void native_gr_rms_norm_weighted_multi(const float* input, const float* gamma, f
     const dpct::dim3 grid{unsigned(n_rows), unsigned(n_tok), 1u};
     if (n_cols < 1024)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         cuda_stream->parallel_for<dpct_kernel_name<
             class weighted_rms_norm_60b509, dpct_kernel_scalar<256>>>(
@@ -134,8 +133,7 @@ void native_gr_rms_norm_weighted_multi(const float* input, const float* gamma, f
     info::device::max_work_group_size. Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         cuda_stream->parallel_for<dpct_kernel_name<
             class weighted_rms_norm_9382c8, dpct_kernel_scalar<1024>>>(

@@ -3048,8 +3048,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 1: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3072,8 +3071,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 2: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3096,8 +3094,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 3: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3120,8 +3117,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 4: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3144,8 +3140,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 5: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3168,8 +3163,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
     case 6: {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3194,8 +3188,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
             */
         if (ncols <= 1) {
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->submit([&](sycl::handler &cgh) {
 
@@ -3219,8 +3212,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         */
         else {
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->submit([&](sycl::handler &cgh) {
 
@@ -3251,8 +3243,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
     */
     if constexpr (!kSplit<TY>) {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3272,8 +3263,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
     */
     else if (g_old_kernels) {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
 
@@ -3775,8 +3765,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
                          (unsigned)cap_groups);
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->submit([&](sycl::handler &cgh) {
@@ -3797,8 +3786,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
         });
     }
     if (FQ) {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_a7b554>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
@@ -3810,8 +3798,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
             });
     } else {
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<
                 dpct_kernel_name<class swiglu_entries_kernel_a4959c>>(
@@ -3824,8 +3811,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
                 });
         }
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
@@ -3844,8 +3830,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
     const dpct::dim3 gd((unsigned)(L.n_embd / (8 * RD)), (unsigned)cap_groups);
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->submit([&](sycl::handler &cgh) {
@@ -4238,8 +4223,7 @@ void s27_launch(const NativeExpertLayout &L, int64_t cap_groups,
     const dpct::dim3 ggu((unsigned)(2 * L.n_ff / (GU_ROWS * RG)),
                          (unsigned)cap_groups);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<
@@ -4255,8 +4239,7 @@ void s27_launch(const NativeExpertLayout &L, int64_t cap_groups,
             });
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_a7f255>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
@@ -4269,8 +4252,7 @@ void s27_launch(const NativeExpertLayout &L, int64_t cap_groups,
     }
     const dpct::dim3 gd((unsigned)(L.n_embd / (8 * RD)), (unsigned)cap_groups);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<
             dpct_kernel_name<class s27_down_kernel_d38356,
@@ -4318,7 +4300,7 @@ void launch_gu_port(unsigned groups, dpct::queue_ptr s, const unsigned long long
                     const NativeExpertLayout &L, float *gate, float *up) {
     constexpr int ROWS = 256 / LN;
     const unsigned gx = (unsigned) ((2 * L.n_ff + ROWS - 1) / ROWS);
-    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     s->parallel_for<dpct_kernel_name<class native_gu_port, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<KM>>>(
         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
@@ -4354,7 +4336,7 @@ void launch_down_port(unsigned groups, dpct::queue_ptr s, const unsigned long lo
                       const NativeExpertLayout &L, float *out) {
     constexpr int ROWS = 256 / LN;
     const unsigned gx = (unsigned) ((L.n_embd + ROWS - 1) / ROWS);
-    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     s->parallel_for<dpct_kernel_name<class native_down_port, dpct_kernel_scalar<TD>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<KM>>>(
         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
@@ -4389,7 +4371,7 @@ template <int TG, bool STAGE_GRID>
 void launch_gu_multi(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
                      const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
                      const NativeExpertLayout &L, float *gate, float *up) {
-    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     const sycl::range<3> g(1, grid.y, (size_t) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS));
     s->parallel_for<dpct_kernel_name<class native_gu_multi_split, dpct_kernel_scalar<TG>,
                                      dpct_kernel_scalar<STAGE_GRID>>>(
@@ -4424,7 +4406,7 @@ template <int TD>
 void launch_down_multi(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long long *grp_ptr,
                        const int32_t *grp_start, const int32_t *n_groups, const int32_t *ent_dst,
                        const block_q8_1 *hq, const NativeExpertLayout &L, float *out) {
-    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     const size_t gx = (size_t) ((L.n_embd + GU_ROWS - 1) / GU_ROWS);
     s->parallel_for<dpct_kernel_name<class native_down_multi_split, dpct_kernel_scalar<TD>>>(
         sycl::nd_range<3>(sycl::range<3>(1, grid.y, gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
@@ -4486,8 +4468,7 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
     const long long n = (long long) n_rows * n_cols;
     if (n <= 0) return;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class quantize_q8_1_kernel_422964>>(
@@ -4609,8 +4590,7 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
     if (n % 256 != 0 || !is_iq(t) || scale != nullptr) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp16});
@@ -4651,8 +4631,7 @@ void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* to
     if (n_embd % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp16});
@@ -4680,8 +4659,7 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
     if (n % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp16});
@@ -4711,8 +4689,7 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     const int64_t per_row = n_embd / 256;
     {
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             strata::q_of(stream)->get_device(),
             {sycl::aspect::fp16});
@@ -4764,8 +4741,7 @@ void iq_dequant_expert_f16(int gt, int dt, const void* gate, const void* up, con
     }
     const int64_t per_row = n_embd / 256, gu_wgs = 2 * n_ff * per_row, d_wgs = n_ff * n_embd / 256;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(strata::q_of(stream)->get_device(), {sycl::aspect::fp16});
         strata::q_of(stream)->submit([&](sycl::handler &cgh) {
             cgh.parallel_for<dpct_kernel_name<class dequant_expert_kernel_7d2c41>>(
@@ -5464,8 +5440,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
     if (sw_v1) {
             {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 s->parallel_for<
                     dpct_kernel_name<class swiglu_entries_kernel_a4959c>>(
@@ -5478,8 +5453,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                     });
             }
             {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
                 dpct::has_capability_or_fail(s->get_device(),
                                              {sycl::aspect::fp16});
 
@@ -5496,8 +5470,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                         });
             }
     } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<
                 dpct_kernel_name<class swiglu_q8_1_entries_kernel_115291>>(

@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/sycl.hpp>
 #include <unordered_map>
@@ -46,7 +47,12 @@ public:
     }
     auto graph = new sycl::ext::oneapi::experimental::command_graph<
         sycl::ext::oneapi::experimental::graph_state::modifiable>(
-        queue_ptr->get_context(), queue_ptr->get_device());
+        queue_ptr->get_context(), queue_ptr->get_device(),
+        []() -> sycl::property_list {
+          const char *v = std::getenv("STRATA_NATIVE_GRAPH");   // Standard an; =0 normale Aufnahme
+          if (v != nullptr && std::atoi(v) == 0) return {};
+          return sycl::property_list{sycl::ext::oneapi::experimental::property::graph::enable_native_recording{}};
+        }());
     auto result = queue_graph_map.insert({queue_ptr, graph});
     if (!result.second) {
       delete graph;

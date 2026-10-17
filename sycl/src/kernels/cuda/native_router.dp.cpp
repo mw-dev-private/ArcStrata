@@ -233,8 +233,7 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class route_96e6fb>>(

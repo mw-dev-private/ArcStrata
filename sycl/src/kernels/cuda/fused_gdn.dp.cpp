@@ -237,8 +237,7 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
         std::exit(1);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_conv_l2_kernel_44cd0c>>(
@@ -272,8 +271,7 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::exit(1);
     }
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_ab_kernel_c211b9>>(
@@ -314,8 +312,7 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
     Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class gdn_step_norm_kernel_51bed3>>(

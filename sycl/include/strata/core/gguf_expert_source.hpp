@@ -37,6 +37,10 @@ public:
     void close();
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    /// Only the mirrored blobs are stable: a ring slot is recycled by later `blob()` calls, and the prompt path can
+    /// stream thousands of them through the ring while another thread computes from a pointer taken here (the prefill's
+    /// CPU share).  null = not mirrored: that expert stays on the GPU.
+    const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
     /// The blob gathered straight into `dst` (bytes = the layer's blob size), from any thread: no ring slot, so the
     /// prompt path's stager threads read the streamed experts themselves instead of holding ring pointers that a
     /// later blob() call overwrites (the 80k-token run of 2026-09-30 streamed ~1,900 blobs per chunk through 512 slots).

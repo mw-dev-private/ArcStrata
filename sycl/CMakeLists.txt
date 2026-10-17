@@ -50,6 +50,32 @@ if(STRATA_SYCL_AOT)
 else()
   set(_sycl_link -fsycl)
 endif()
+# --- Intel's chunk_gated_delta_rule_xe2 as an opt-in GDN delta stage (README_gdn.md) ----------------------------
+# Vendored, torch-free copy under src/prefill/intel_gdn/ (vllm-xpu-kernels 0.1.14.1 + cutlass-sycl 4.2.1 headers).
+# Built always (when cutlass is found), chosen only at run time with STRATA_GDN_INTEL=1; the default GDN path
+# stays bit-identical. cute's GEMM path needs SPIR-V extensions at the device link and 256-GRF at AOT - the same
+# flags the upstream vllm-xpu-kernels build passes (its CMakeLists L289-291, cmake/utils.cmake L600).
+option(STRATA_INTEL_GDN "build Intel's GDN delta kernel for STRATA_GDN_INTEL=1 (needs the cutlass-sycl sources)" ON)
+set(STRATA_INTEL_GDN_ON 0)
+if(STRATA_INTEL_GDN)
+  set(STRATA_CUTLASS_SYCL_DIR "$ENV{HOME}/src/vllm-xpu-kernels/.deps/cutlass-sycl-src"
+      CACHE PATH "cutlass-sycl source tree (include/, tools/util/include/, applications/)")
+  if(EXISTS "${STRATA_CUTLASS_SYCL_DIR}/include/cute/tensor.hpp")
+    set(STRATA_INTEL_GDN_ON 1)
+    list(APPEND _sycl_link "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate")
+    if(STRATA_SYCL_AOT)
+      # rebuild the AOT backend string with the GRF budget the vendored kernel's launch property requests
+      set(_sycl_link -fsycl -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen
+          "-device ${STRATA_SYCL_AOT} -options -cl-fp32-correctly-rounded-divide-sqrt -internal_options -cl-intel-256-GRF-per-thread")
+      list(APPEND _sycl_link "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate")
+    endif()
+    # (the library target itself is created further below, AFTER add_compile_options - a SYCL target
+    #  created before it would compile without -fsycl and fail on <sycl/sycl.hpp>)
+    message(STATUS "Intel GDN delta kernel: ON (cutlass-sycl at ${STRATA_CUTLASS_SYCL_DIR})")
+  else()
+    message(STATUS "Intel GDN delta kernel: OFF (no cutlass-sycl at ${STRATA_CUTLASS_SYCL_DIR}; STRATA_GDN_INTEL stays inert)")
+  endif()
+endif()
 # The Intel GPU's fp32 divide is not correctly rounded by default (OpenCL allows 2.5 ulp). Strata's quantizers
 # are byte-exact against ggml through `amax / 127`, so the device compiler is told to round divides and sqrt
 # properly; measured: quantize_act_parity goes from 303k mismatches to byte-exact. (Same as
@@ -83,6 +109,19 @@ list(APPEND _sycl_flags -fsycl-device-code-split=per_kernel)
 add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${_sycl_flags}>" -fp-model=precise -Wno-unused-parameter
                     -Wno-unused-variable -Wno-deprecated-declarations)
 add_link_options(${_sycl_link})
+if(STRATA_INTEL_GDN_ON)   # only here, so the -fsycl above applies (a SYCL library before it would not see it)
+  add_library(strata_intel_gdn STATIC src/prefill/intel_gdn/intel_gdn_stage.dp.cpp)
+  target_include_directories(strata_intel_gdn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/intel_gdn
+    ${STRATA_CUTLASS_SYCL_DIR}/include ${STRATA_CUTLASS_SYCL_DIR}/tools/util/include ${STRATA_CUTLASS_SYCL_DIR}/applications)
+  target_compile_definitions(strata_intel_gdn PRIVATE CUTLASS_ENABLE_HEADERS_ONLY CUTLASS_ENABLE_SYCL
+    SYCL_INTEL_TARGET CUTLASS_VERSIONS_GENERATED VLLM_XPU_ENABLE_XE2)
+  # die vendored cute-Kerne verlangen ausdruecklich 16-Lane-Sub-Gruppen (kernel_props:
+  # syclex::sub_group_size<cute::detail::subgroup_size>, gdn_kernels_xe2.hpp L1297-1299; die 16 kommt aus
+  # cutlass copy_xe_legacy_U4.hpp). Das Verzeichnis erzwingt -fsycl-default-sub-group-size=32 fuer Stratas
+  # Warp-Kerne — hier zurueckgenommen, damit diese TU dieselbe Compile-Zeit wie der Radbau bekommt, gegen
+  # den der s4-Bench bestanden hat. Ziel-Optionen kommen nach den Verzeichnis-Optionen, die letzte gewinnt.
+  target_compile_options(strata_intel_gdn PRIVATE -fsycl-default-sub-group-size=16)
+endif()
 
 # --- source resolution: the migrated copy when there is one, the original otherwise -------------------------------
 function(strata_resolve out)
@@ -245,6 +284,10 @@ add_library(strata_prefill STATIC ${_prefill}
 target_compile_options(strata_prefill PUBLIC -qmkl=sequential)
 target_link_options(strata_prefill PUBLIC -qmkl=sequential)
 target_link_libraries(strata_prefill PUBLIC strata_engine)
+if(STRATA_INTEL_GDN_ON)   # opt-in Intel delta stage (README_gdn.md): the arm lives in src/prefill/intel_gdn/
+  target_compile_definitions(strata_prefill PRIVATE STRATA_INTEL_GDN=1)
+  target_link_libraries(strata_prefill PUBLIC strata_intel_gdn)
+endif()
 
 strata_resolve(_main src/program/generate.cpp)
 add_executable(strata ${_main})
@@ -264,6 +307,16 @@ if(STRATA_SYCL_PARITY)
   endforeach()
   target_link_libraries(gdn_parity PRIVATE strata_prefill)  # prefill recurrence variant tests
   add_test(NAME prefill_gdn_parity COMMAND gdn_parity --selftest --prefill-only)
+  if(STRATA_INTEL_GDN_ON)   # Intel-Delta-Arm (README_gdn.md): Wirtsselftest der Umbauten + GPU-Vergleich
+    add_executable(intel_gdn_parity src/kernels/gdn_intel_parity.cpp)   # neu, kein .cu-Vorbild -> kein strata_resolve
+    target_include_directories(intel_gdn_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill)  # "intel_gdn/intel_gdn.hpp"
+    target_link_libraries(intel_gdn_parity PRIVATE strata_prefill strata_intel_gdn)
+    add_test(NAME intel_gdn_parity COMMAND intel_gdn_parity --selftest)
+    # Mikrobench Stage-Aufwand/Schicht (Runde 3, Aufgabe 2): fahrt der Owner im Fenster, nicht im ctest.
+    add_executable(gdn_stage_bench ${CMAKE_CURRENT_SOURCE_DIR}/../bench/gdn_stage_bench.cpp)
+    target_include_directories(gdn_stage_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill)
+    target_link_libraries(gdn_stage_bench PRIVATE strata_prefill strata_intel_gdn)
+  endif()
   # #1795: iq_parity and ple_parity are registered as the top-level CMakeLists.txt does, not by the loop above
   # (iq_parity takes a fixture directory, not --selftest; ple_parity reads real artifacts from the engine root).
   foreach(p IN ITEMS iq ple)
@@ -353,6 +406,15 @@ if(STRATA_SYCL_PARITY)
   strata_resolve(_src src/kernels/qsa_prompt_attn_parity.cpp)
   add_executable(qsa_prompt_attn_parity ${_src})
   target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels)
+  # what limits the prompt path's attention kernel: format x selection x width scaling (14.10. breakdown), built, not registered
+  strata_resolve(_src src/kernels/qsa_attn_scale_bench.cpp)
+  add_executable(qsa_attn_scale_bench ${_src})
+  target_link_libraries(qsa_attn_scale_bench PRIVATE strata_kernels)
+  # same bench with the attention kernel's plain barriers replaced by local-space barriers (no global fence): a copy of qsa_decode_attn.dp.cpp
+  strata_resolve(_src_lb src/kernels/cuda/qsa_decode_attn_lb.dp.cpp)
+  strata_resolve(_src_b src/kernels/qsa_attn_scale_bench.cpp)
+  add_executable(qsa_attn_scale_bench_lb ${_src_b} ${_src_lb})
+  target_link_libraries(qsa_attn_scale_bench_lb PRIVATE strata_kernels)
   # the hybrid K8V4 KV test (upstream 0.1.27) passes its appends, gathers and attention here and fails only its
   # last step, the same tensor-core prompt kernel. Built, not registered, until that kernel is ported.
   strata_resolve(_src src/kernels/kv_hybrid_parity.cpp)
@@ -365,6 +427,12 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(mmvq_bench PRIVATE strata_kernels)
   add_executable(dense_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/dense_bench.cpp)   # the decode window's dense GEMVs, graph, hash
   target_link_libraries(dense_bench PRIVATE strata_kernels)
+  add_executable(mmvq_q4k_fast_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_q4k_fast_parity.cpp)   # Q4K scale decode FAST vs wide kernel, bitwise
+  target_link_libraries(mmvq_q4k_fast_parity PRIVATE strata_kernels)
+  add_executable(mmvq_q5k_fast_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_q5k_fast_parity.cpp)   # Q5K scale decode FAST vs wide kernel, bitwise
+  target_link_libraries(mmvq_q5k_fast_parity PRIVATE strata_kernels)
+  add_executable(mmvq_q6k_fast_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_q6k_fast_parity.cpp)   # Q6_K FAST unpack vs wide kernel, bitwise
+  target_link_libraries(mmvq_q6k_fast_parity PRIVATE strata_kernels)
   add_executable(mmvq_sg_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_sg_bench.cpp)   # SIMD16 vs 32 decode mmvq
   target_link_libraries(mmvq_sg_bench PRIVATE strata_kernels)
   add_executable(q6k_align_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/q6k_align_bench.cpp)   # Q6_K block alignment
@@ -394,3 +462,22 @@ if(STRATA_SYCL_PARITY)
     target_link_libraries(kq_cpu_bench PRIVATE strata_kernels_cpu)
   endif()
 endif()
+
+# Host-only routing parity: no SYCL runtime or device access even when executed.
+add_custom_target(tail_skip_host_check ALL
+  COMMAND /usr/bin/c++ -std=c++17 -O2
+          -I${CMAKE_CURRENT_SOURCE_DIR}/include
+          ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/tail_skip_host_parity.cpp
+          -o ${CMAKE_CURRENT_BINARY_DIR}/tail_skip_host_parity
+  BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/tail_skip_host_parity
+  VERBATIM)
+# Standalone CPU checks: compiled without SYCL, never enumerate a device.
+add_custom_target(prefill_share_host_checks ALL
+  COMMAND /usr/bin/c++ -std=c++20 -O2 -I${STRATA_ROOT}/include
+          ${STRATA_ROOT}/tests/prefill/cpu_share_rows_test.cpp
+          -o ${CMAKE_CURRENT_BINARY_DIR}/cpu_share_rows_test
+  COMMAND /usr/bin/c++ -std=c++20 -O2 -I${STRATA_ROOT}/include
+          ${STRATA_ROOT}/tests/prefill/share_rules_test.cpp
+          -o ${CMAKE_CURRENT_BINARY_DIR}/share_rules_test
+  BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/cpu_share_rows_test ${CMAKE_CURRENT_BINARY_DIR}/share_rules_test
+  VERBATIM)

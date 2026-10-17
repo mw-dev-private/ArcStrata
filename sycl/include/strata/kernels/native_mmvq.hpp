@@ -31,6 +31,8 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // single-column call. Set before
 // graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
+void native_mmvq_set_k4_fast(bool on);   // SYCL port: branch-free scale/min decode in the wide Q4_K/Q5_K kernels, bit-identical, default off (STRATA_MMVQ_K4_FAST)
+void native_mmvq_set_q6k_fast(bool on);   // SYCL port: cheaper 6-bit unpack in the wide Q6_K kernel, bit-identical, default off (STRATA_MMVQ_Q6K_FAST)
 void native_mmvq_set_q6k_wide(bool on);   // SYCL port: the 16-byte-load Q6_K kernel (default on)
 void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                                 void* stream);   // SYCL port: experiment, Q6_K blocks at a 224-byte stride
@@ -114,6 +116,9 @@ void native_q8_0_packed_unregister(const void* gguf_weights);
 bool native_q6_k_packed_enabled();
 bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what);
 void native_q6_k_unpack(const void* weights);
+/// Startup only: reconstruct selected original Q6 rows from in-place planes. IDs must be validated by the caller.
+bool native_q6_k_gather_packed_rows(const void* weights, int64_t row_bytes,
+                                  const int32_t* indices, int64_t count, uint8_t* dst, void* stream);
 
 /// STRATA_Q6_PLANAR (SYCL port; =0 turns it off): the Q6_K output heads stored as planes - ql (128 B), qh (64 B), the scales
 /// (16 B, each lane's pair adjacent), d (2 B) of every 210-byte block - so the decode kernel's weight loads are single

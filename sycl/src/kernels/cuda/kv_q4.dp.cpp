@@ -248,8 +248,7 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
     const int rows_per_block = 4;
     const int64_t num_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -278,8 +277,7 @@ void kv_append_q4_steps(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table,
     const dpct::dim3 grid((unsigned)s.n_head_kv, (unsigned)(s.head_dim / QK4_0),
                           (unsigned)(n_steps * planes));
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
@@ -320,8 +318,7 @@ void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64
     const KvHostPools h = host ? *host : KvHostPools{}, st = stage ? *stage : KvHostPools{};
     for (int is_v = 0; is_v < 2; ++is_v)
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         cs->parallel_for<
             dpct_kernel_name<class kv_append_q4_batch_kernel_11c37a>>(
@@ -346,8 +343,7 @@ void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* 
     const int rows_per_block = 4;
     const unsigned num_blocks = (unsigned) ((total_blocks + rows_per_block - 1) / rows_per_block);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class kv_gather_q4_kernel_300c16>>(

@@ -65,16 +65,22 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 /// out projection reads); y is FP32 scratch.
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
-                    int64_t ld16 = 0);   // ld16: y16's row stride (0 = 6144; S23 STRATA_PF_PAD pads it)
+                    int64_t ld16 = 0,   // ld16: y16's row stride (0 = 6144; S23 STRATA_PF_PAD pads it)
+                    const float* ab = nullptr, const float* dt = nullptr,
+                    const float* ssm_a = nullptr);   // raw gates for the Intel arm (see below; null = never Intel)
 /// The kernels behind gdn_recurrence, for the parity test: 0 = the column-split kernels + the norm kernel (or the
 /// one-block-per-head kernel under STRATA_GDN_REC_HEADS), 1 = four lanes per column (no barrier per token) + the grid-stride norm, 2 = the
 /// one-block-per-head kernel (its fused norm rounds differently).  0 and 1 give the same bits.  On HIP, 0 and 1 run the opt-in
 /// chunked WMMA recurrence instead (gfx11, STRATA_GDN_CHUNKED=1, 64 tokens and more: other bits, see docs/AMD_HIP.md).
 /// SYCL only: 6 = the Xe sub-group recurrence (16-lane sub-groups, one barrier per token) + the norm kernel, the same
 /// bits as 0 on an Arc A770; gdn_recurrence takes it by default on Alchemist (STRATA_GDN_XE=0 off, =1 any Intel GPU).
+/// SYCL only: 9 = Intel's chunk_gated_delta_rule_xe2 (STRATA_GDN_INTEL=1, README_gdn.md): it reads the raw gates
+/// (ab [T,2*HV], dt [HV], ssm_a [HV]) instead of the folded gate/beta, needs the ab/dt/ssm_a arguments below and
+/// falls back to variant 6's kernel if the shape is unsupported or the arm failed. Only built with STRATA_INTEL_GDN.
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
-                            void* stream, int64_t ld16 = 0);
+                            void* stream, int64_t ld16 = 0,
+                            const float* ab = nullptr, const float* dt = nullptr, const float* ssm_a = nullptr);
 
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).

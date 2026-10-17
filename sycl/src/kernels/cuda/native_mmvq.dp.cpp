@@ -1545,14 +1545,40 @@ __dpct_inline__ sycl::int4 load16_a2(const void* p) {
     for (int i = 0; i < 4; ++i) o[i] = half ? (w[i] >> 16) | (w[i + 1] << 16) : w[i];
     return sycl::int4((int) o[0], (int) o[1], (int) o[2], (int) o[3]);
 }
+std::atomic<int> g_q6k_fast{-1};   // -1: read STRATA_MMVQ_Q6K_FAST (default off); 0/1: native_mmvq_set_q6k_fast
+inline bool q6k_fast() {
+    int v = g_q6k_fast.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("STRATA_MMVQ_Q6K_FAST");
+        v = (e != nullptr && std::atoi(e) != 0) ? 1 : 0;
+        g_q6k_fast.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+std::atomic<int> g_k4_fast{-1};   // -1: read STRATA_MMVQ_K4_FAST (default off); 0/1: native_mmvq_set_k4_fast
+inline bool k4_fast() {
+    int v = g_k4_fast.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("STRATA_MMVQ_K4_FAST");
+        v = (e != nullptr && std::atoi(e) != 0) ? 1 : 0;
+        g_k4_fast.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
 inline bool q6k_a2() {   // STRATA_MMVQ_A2=0 turns the aligned-load path off
     static const bool v = std::getenv("STRATA_MMVQ_A2") == nullptr || std::atoi(std::getenv("STRATA_MMVQ_A2")) != 0;
     return v;
 }
 
-template <int NCOLS, int RPW, int SG = WARP, int BS = (int) sizeof(Q6KBlock), bool A2 = false>   // BS: block stride
+// FAST (STRATA_MMVQ_Q6K_FAST, opt-in): the 6-bit values minus 32 as one packed SWAR subtraction instead of the dpct
+// char4 sub_sat. The codes are 0..63, so q - 32 is -32..31 and never saturates; the bytes are identical, so the
+// result is bit-identical. ((x | 0x80..) - 0x20..) cannot borrow across bytes (every byte >= 0x80), ^ 0x80.. restores it.
+__dpct_inline__ uint32_t q6_minus32(uint32_t x) { return ((x | 0x80808080u) - 0x20202020u) ^ 0x80808080u; }
+template <int NCOLS, int RPW, int SG = WARP, int BS = (int) sizeof(Q6KBlock), bool A2 = false, bool PLANES = false, bool FAST = false>   // BS: block stride
 void native_mmvq_q6k_wide_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
-                                 float* __restrict__ y, int n_in, int n_out) {
+                                 float* __restrict__ y, int n_in, int n_out,
+                                 const int* plane_ql = nullptr, const int* plane_qh = nullptr,
+                                 const int8_t* plane_sc = nullptr, const sycl::half* plane_d = nullptr) {
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int lane = int(item.get_local_id(2)), warp = int(item.get_local_id(1));
     constexpr int NWG = WARPS * WARP / SG;              // sub-groups per work-group
@@ -1571,17 +1597,27 @@ void native_mmvq_q6k_wide_kernel(const Q6KBlock* __restrict__ w, const Q81Block*
         sycl::int4 ql4[RPW], qh4[RPW]; float dsc0[RPW], dsc1[RPW];
 #pragma unroll
         for (int r = 0; r < RPW; ++r) {
-            const Q6KBlock* b = reinterpret_cast<const Q6KBlock*>(reinterpret_cast<const uint8_t*>(w) +
-                (std::size_t(row0 + (row0 + r < n_out ? r : 0)) * blocks_per_row + kbx) * BS);
-            if constexpr (A2) {
-                ql4[r] = load16_a2(b->ql + 16 * g);
-                qh4[r] = load16_a2(b->qh + 16 * qh4_idx);
+            if constexpr (PLANES) {
+                // Same row/lane ownership and arithmetic; only the byte addresses change.
+                const size_t block = std::size_t(row0 + (row0 + r < n_out ? r : 0)) * blocks_per_row + kbx;
+                ql4[r] = reinterpret_cast<const sycl::int4*>(plane_ql)[block * 8 + g];
+                qh4[r] = reinterpret_cast<const sycl::int4*>(plane_qh)[block * 4 + qh4_idx];
+                const float d = plane_d[block];
+                dsc0[r] = d * (float) plane_sc[block * 16 + scale_offset];
+                dsc1[r] = d * (float) plane_sc[block * 16 + scale_offset + 4];
             } else {
-                ql4[r] = reinterpret_cast<const sycl::int4*>(b->ql)[g];
-                qh4[r] = reinterpret_cast<const sycl::int4*>(b->qh)[qh4_idx];
+                const Q6KBlock* b = reinterpret_cast<const Q6KBlock*>(reinterpret_cast<const uint8_t*>(w) +
+                    (std::size_t(row0 + (row0 + r < n_out ? r : 0)) * blocks_per_row + kbx) * BS);
+                if constexpr (A2) {
+                    ql4[r] = load16_a2(b->ql + 16 * g);
+                    qh4[r] = load16_a2(b->qh + 16 * qh4_idx);
+                } else {
+                    ql4[r] = reinterpret_cast<const sycl::int4*>(b->ql)[g];
+                    qh4[r] = reinterpret_cast<const sycl::int4*>(b->qh)[qh4_idx];
+                }
+                const float d = b->d;
+                dsc0[r] = d * (float) b->scales[scale_offset]; dsc1[r] = d * (float) b->scales[scale_offset + 4];
             }
-            const float d = b->d;
-            dsc0[r] = d * (float) b->scales[scale_offset]; dsc1[r] = d * (float) b->scales[scale_offset + 4];
         }
         // the activations once per column, shared by the RPW rows
         sycl::int4 u0[NCOLS], u1[NCOLS];
@@ -1629,6 +1665,103 @@ void native_mmvq_q6k_wide_kernel(const Q6KBlock* __restrict__ w, const Q81Block*
             for (int o = SG / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
             if (lane == 0 && row0 + r < n_out) y[std::size_t(j) * n_out + row0 + r] = v;
         }
+}
+// SYCL port (opt-in, STRATA_Q6_WIDE_COOP=1): the wide Q6_K kernel with the weight bytes loaded cooperatively. A Q6_K block
+// is 210 bytes at a 2-byte aligned address, so every lane's own 16-byte ql/qh load is split by the hardware (see
+// load16_a2). Here the 32 lanes load the 16-byte aligned chunks that cover their 4 blocks (at most 14 per block, two
+// loads per lane) into local memory, and each lane then reads the same ql/qh/scale/d bytes the A2 kernel reads, at the
+// same lane/k ownership and in the same arithmetic order: every output has the same bits. One row per sub-group.
+template <int NCOLS, bool FAST = false>
+void native_mmvq_q6k_wide_coop_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
+                                      float* __restrict__ y, int n_in, int n_out) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int lane = int(item.get_local_id(2)), warp = int(item.get_local_id(1));
+    const int row0 = int(item.get_group(2)) * WARPS + warp;
+    auto sg = item.get_sub_group();
+    // 4 blocks x 224 bytes (14 chunks) per sub-group; a guard word so a 5-dword read at the end stays inside
+    auto& slm = *sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[WARPS * 4 * 60]>(item.get_group());
+    uint32_t* tile = &slm[0] + (warp * 4) * 60;
+    const bool row_ok = row0 < n_out;
+    const int blocks_per_row = n_in / QK, x_stride = n_in / Q8K;
+    const int g = lane & 7, sub = lane >> 3;
+    const int vh_shift = 2 * ((g & 3) >> 1);
+    const int qh4_idx = 2 * (g >> 2) + (g & 1);
+    const int scale_offset = 8 * (g >> 2) + (g & 3);
+    const int bq8_offset = 4 * (g >> 2) + ((g & 3) >> 1);
+    const int u_int4 = g & 1;
+    const uint8_t* rowp = reinterpret_cast<const uint8_t*>(w) + std::size_t(row_ok ? row0 : 0) * blocks_per_row * sizeof(Q6KBlock);
+    float acc[NCOLS] = {};
+    for (int kb0 = 0; kb0 < blocks_per_row; kb0 += 4) {
+        const int kbx = kb0 + sub;
+        const bool active = kbx < blocks_per_row;
+        // cooperative, 16-byte aligned load of this lane group's block: chunks g and g+8
+        const uintptr_t baddr = reinterpret_cast<uintptr_t>(rowp + std::size_t(active ? kbx : 0) * sizeof(Q6KBlock));
+        const int A = int(baddr & 15);
+        const int nch = (A + int(sizeof(Q6KBlock)) + 15) >> 4;
+        const sycl::int4* chunks = reinterpret_cast<const sycl::int4*>(baddr & ~uintptr_t(15));
+        uint32_t* t = tile + sub * 60;
+        if (g < nch) { const sycl::int4 v = chunks[g]; t[4 * g] = v.x(); t[4 * g + 1] = v.y(); t[4 * g + 2] = v.z(); t[4 * g + 3] = v.w(); }
+        if (g + 8 < nch) { const sycl::int4 v = chunks[g + 8]; t[4 * (g + 8)] = v.x(); t[4 * (g + 8) + 1] = v.y(); t[4 * (g + 8) + 2] = v.z(); t[4 * (g + 8) + 3] = v.w(); }
+        sycl::group_barrier(sg);
+        if (active && row_ok) {
+            const uint8_t* tb = reinterpret_cast<const uint8_t*>(t);
+            const bool half = (A & 2) != 0;
+            auto rd16 = [&](int byte_off) {   // 16 bytes at tile byte offset byte_off + A (2-byte aligned): five dwords + shift
+                const int d0 = (A + byte_off) >> 2;
+                uint32_t wv[5];
+#pragma unroll
+                for (int i = 0; i < 5; ++i) wv[i] = t[d0 + i];
+                uint32_t o[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) o[i] = half ? (wv[i] >> 16) | (wv[i + 1] << 16) : wv[i];
+                return sycl::int4((int) o[0], (int) o[1], (int) o[2], (int) o[3]);
+            };
+            const sycl::int4 ql4 = rd16(16 * g);
+            const sycl::int4 qh4 = rd16(128 + 16 * qh4_idx);
+            const float d = sycl::bit_cast<sycl::half>(uint16_t(tb[A + 208] | (tb[A + 209] << 8)));
+            const float dsc0 = d * (float) (int8_t) tb[A + 192 + scale_offset], dsc1 = d * (float) (int8_t) tb[A + 192 + scale_offset + 4];
+            const int kby = kbx * (QK / Q8K);
+            const int vl[4] = {ql4.x(), ql4.y(), ql4.z(), ql4.w()};
+            const int vh[4] = {qh4.x() >> vh_shift, qh4.y() >> vh_shift, qh4.z() >> vh_shift, qh4.w() >> vh_shift};
+            int vi0[4], vi1[4];
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                if constexpr (FAST) {
+                    vi0[p] = (int) q6_minus32((uint32_t) ((vl[p] & 0x0f0f0f0f) | ((vh[p] << 4) & 0x30303030)));
+                    vi1[p] = (int) q6_minus32((uint32_t) (((vl[p] >> 4) & 0x0f0f0f0f) | (((vh[p] >> 4) << 4) & 0x30303030)));
+                } else {
+                    vi0[p] = dpct::vectorized_binary<sycl::char4>((vl[p] & 0x0f0f0f0f) | ((vh[p] << 4) & 0x30303030), 0x20202020, dpct::sub_sat());
+                    vi1[p] = dpct::vectorized_binary<sycl::char4>(((vl[p] >> 4) & 0x0f0f0f0f) | (((vh[p] >> 4) << 4) & 0x30303030), 0x20202020, dpct::sub_sat());
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                const Q81Block* xb = x + std::size_t(j) * x_stride + kby + bq8_offset;
+                const int* p0 = reinterpret_cast<const int*>(xb[0].qs) + 4 * u_int4;
+                const int* p1 = reinterpret_cast<const int*>(xb[2].qs) + 4 * u_int4;
+                const sycl::int4 u0(p0[0], p0[1], p0[2], p0[3]), u1(p1[0], p1[1], p1[2], p1[3]);
+                const float ds0 = xb[0].ds[0], ds1 = xb[2].ds[0];
+                int s0 = 0, s1 = 0;
+                s0 = strata::dp4a(vi0[0], u0.x(), s0); s0 = strata::dp4a(vi0[1], u0.y(), s0);
+                s0 = strata::dp4a(vi0[2], u0.z(), s0); s0 = strata::dp4a(vi0[3], u0.w(), s0);
+                s1 = strata::dp4a(vi1[0], u1.x(), s1); s1 = strata::dp4a(vi1[1], u1.y(), s1);
+                s1 = strata::dp4a(vi1[2], u1.z(), s1); s1 = strata::dp4a(vi1[3], u1.w(), s1);
+                acc[j] += ds0 * dsc0 * (float) s0 + ds1 * dsc1 * (float) s1;
+            }
+        }
+        sycl::group_barrier(sg);   // the tile is reused by the next iteration
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        float v = acc[j];
+#pragma unroll
+        for (int o = WARP / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+        if (lane == 0 && row_ok) y[std::size_t(j) * n_out + row0] = v;
+    }
+}
+inline bool q6k_wide_coop() {   // STRATA_Q6_WIDE_COOP=1: the cooperative-load wide Q6_K kernel (opt-in)
+    static const bool v = std::getenv("STRATA_Q6_WIDE_COOP") && std::atoi(std::getenv("STRATA_Q6_WIDE_COOP")) != 0;
+    return v;
 }
 // SYCL port: the wide Q6_K kernel with its weight loads issued U steps ahead. The wide kernel's 2560-wide rows
 // are ~3 steps of load -> wait -> dot per sub-group, so each sub-group has one 16-byte load per lane in flight
@@ -1749,6 +1882,28 @@ void launch_q6k_wide(const void* weights, const void* x_q8_1, float* y, int n_in
         STRATA_Q6PF(2) STRATA_Q6PF(3) STRATA_Q6PF(4) STRATA_Q6PF(6)
 #undef STRATA_Q6PF
     }
+    if (q6k_wide_coop() && rpw == 1) {
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        if (q6k_fast()) {   // opt-in: bit-identical, cheaper 6-bit unpack inside the production (cooperative) kernel
+            s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_wide_coop_fast, dpct_kernel_scalar<NCOLS>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_q6k_wide_coop_kernel<NCOLS, true>(w, x, y, n_in, n_out); });
+        } else {
+            s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_wide_coop, dpct_kernel_scalar<NCOLS>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_q6k_wide_coop_kernel<NCOLS>(w, x, y, n_in, n_out); });
+        }
+        return;
+    }
+    if (rpw == 1 && q6k_a2() && q6k_fast()) {   // opt-in: bit-identical, cheaper 6-bit unpack
+        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+        s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_wide_a2_fast, dpct_kernel_scalar<NCOLS>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
+            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                native_mmvq_q6k_wide_kernel<NCOLS, 1, WARP, (int) sizeof(Q6KBlock), true, false, true>(w, x, y, n_in, n_out);
+            });
+        return;
+    }
     if (rpw == 1 && q6k_a2()) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
         if constexpr (NCOLS > 1) {
@@ -1816,7 +1971,24 @@ __dpct_inline__ void k4_scale_min(const uint8_t* sc, int j, float& s, float& m) 
     if (j < 4) { s = (float) (sc[j] & 63); m = (float) (sc[j + 4] & 63); }
     else { s = (float) ((sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4)); m = (float) ((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4)); }
 }
-struct WideQ4K {
+// K-quant scale/min of two consecutive sub-blocks (sb, sb+1, sb even) from the three dwords of the 12 scale bytes: the
+// same integers as two k4_scale_min calls (byte loads and a branch per call), without per-byte loads or branches.
+__dpct_inline__ void k4_scale_min2(const uint8_t* sc, int sb, float& s0, float& m0, float& s1, float& m1) {
+    const int* w = reinterpret_cast<const int*>(sc);   // scales sits at offset 4 of the 144/176-byte blocks: 4-byte aligned
+    const int w0 = w[0], w1 = w[1], w2 = w[2];
+    const int sh = 8 * (sb & 3);
+    const bool hi = sb >= 4;
+    auto one = [&](int s_) {
+        const int a0 = w0 >> s_, a1 = w1 >> s_, a2 = w2 >> s_;
+        const int sl = a0 & 63, ml = a1 & 63;
+        const int sh_ = (a2 & 0xF) | (((a0 >> 6) & 3) << 4), mh = ((a2 >> 4) & 0xF) | (((a1 >> 6) & 3) << 4);
+        return sycl::int2(hi ? sh_ : sl, hi ? mh : ml);
+    };
+    const sycl::int2 p = one(sh), q = one(sh + 8);
+    s0 = (float) p.x(); m0 = (float) p.y(); s1 = (float) q.x(); m1 = (float) q.y();
+}
+template <bool FAST>
+struct WideQ4KT {
     using Block = Q4KBlock;
     struct W { sycl::int4 lo, hi; float dl, dh, ml, mh; int sb, half; };
     static W load(const Block* b, int g) {
@@ -1825,7 +1997,9 @@ struct WideQ4K {
         r.lo = sycl::int4(q.x() & 0x0f0f0f0f, q.y() & 0x0f0f0f0f, q.z() & 0x0f0f0f0f, q.w() & 0x0f0f0f0f);
         r.hi = sycl::int4((q.x() >> 4) & 0x0f0f0f0f, (q.y() >> 4) & 0x0f0f0f0f, (q.z() >> 4) & 0x0f0f0f0f, (q.w() >> 4) & 0x0f0f0f0f);
         const sycl::float2 dm = b->dm.convert<float, sycl::rounding_mode::automatic>();
-        float s0, m0, s1, m1; k4_scale_min(b->scales, r.sb, s0, m0); k4_scale_min(b->scales, r.sb + 1, s1, m1);
+        float s0, m0, s1, m1;
+        if constexpr (FAST) k4_scale_min2(b->scales, r.sb, s0, m0, s1, m1);
+        else { k4_scale_min(b->scales, r.sb, s0, m0); k4_scale_min(b->scales, r.sb + 1, s1, m1); }
         r.dl = dm.x() * s0; r.ml = dm.y() * m0; r.dh = dm.x() * s1; r.mh = dm.y() * m1;
         return r;
     }
@@ -1851,9 +2025,10 @@ struct WideQ4K {
                v.dc * (r.dh * (float) dp4a4(r.hi, v.uc, 0) - r.mh * (float) dp4a4(ones, v.uc, 0));
     }
 };
-struct WideQ5K {
+template <bool FAST>
+struct WideQ5KT {
     using Block = Q5KBlock;
-    using W = WideQ4K::W;
+    using W = typename WideQ4KT<FAST>::W;
     static W load(const Block* b, int g) {
         W r; r.sb = 2 * (g >> 1); r.half = g & 1;
         const sycl::int4 q = reinterpret_cast<const sycl::int4*>(b->qs)[g];          // qs at 48, 176 = 11 x 16
@@ -1865,15 +2040,21 @@ struct WideQ5K {
         r.hi = sycl::int4(((q.x() >> 4) & 0x0f0f0f0f) | hb(h.x(), sh), ((q.y() >> 4) & 0x0f0f0f0f) | hb(h.y(), sh),
                           ((q.z() >> 4) & 0x0f0f0f0f) | hb(h.z(), sh), ((q.w() >> 4) & 0x0f0f0f0f) | hb(h.w(), sh));
         const sycl::float2 dm = b->dm.convert<float, sycl::rounding_mode::automatic>();
-        float s0, m0, s1, m1; k4_scale_min(b->scales, r.sb, s0, m0); k4_scale_min(b->scales, r.sb + 1, s1, m1);
+        float s0, m0, s1, m1;
+        if constexpr (FAST) k4_scale_min2(b->scales, r.sb, s0, m0, s1, m1);
+        else { k4_scale_min(b->scales, r.sb, s0, m0); k4_scale_min(b->scales, r.sb + 1, s1, m1); }
         r.dl = dm.x() * s0; r.ml = dm.y() * m0; r.dh = dm.x() * s1; r.mh = dm.y() * m1;
         return r;
     }
-    static float apply(const W& r, const Q81Block* xb) { return WideQ4K::apply(r, xb); }
-    using A = WideQ4K::A;
-    static A act(const Q81Block* xb, int g) { return WideQ4K::act(xb, g); }
-    static float dot(const W& r, const A& v) { return WideQ4K::dot(r, v); }
+    static float apply(const W& r, const Q81Block* xb) { return WideQ4KT<FAST>::apply(r, xb); }
+    using A = typename WideQ4KT<FAST>::A;
+    static A act(const Q81Block* xb, int g) { return WideQ4KT<FAST>::act(xb, g); }
+    static float dot(const W& r, const A& v) { return WideQ4KT<FAST>::dot(r, v); }
 };
+using WideQ4K = WideQ4KT<false>;
+using WideQ5K = WideQ5KT<false>;
+using WideQ4KFast = WideQ4KT<true>;
+using WideQ5KFast = WideQ5KT<true>;
 __dpct_inline__ uint32_t iq4_lut4(uint32_t q4) {   // four nibbles -> four codebook bytes, codebook in registers
     constexpr uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;
     uint32_t r = 0;
@@ -2147,8 +2328,7 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
                     int n_out, dpct::queue_ptr s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    auto exp_props = sycl::ext::oneapi::experimental::properties{
-        sycl::ext::oneapi::experimental::use_root_sync};
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
     dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
@@ -2396,8 +2576,7 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
         {
             iq4nl_values.init(*s);
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->submit([&](sycl::handler &cgh) {
                 auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
@@ -2423,8 +2602,7 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
         */
         iq4nl_values.init(*s);
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
             auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
@@ -2592,8 +2770,7 @@ void q8_packed_launch(const Q8Packed &w, const Q81Block *x, float *y,
     const int grid = persist ? (std::min)(w.n_out, Q8P_PERSIST_GRID) : w.n_out;
     if (s26_tsum_on())
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<class native_q8_0_packed_kernel_851f07,
@@ -2608,8 +2785,7 @@ void q8_packed_launch(const Q8Packed &w, const Q81Block *x, float *y,
                     w.qs, w.d, x, y, w.n_in, w.n_out, persist ? grid : w.n_out);
             });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->/*
@@ -2779,25 +2955,51 @@ __dpct_inline__ void native_q6_k_packed_kernel(
 
 bool g_q6_bypass = false;   // the load-time self-test times the GGUF-layout kernels with the copy registered
 
-// the packed planes of one Q6_K matrix (owned: allocated by native_q6_k_pack, freed by native_q6_k_unpack)
+// The registry owns allocated planes; in-place planes remain owned by NativeHead/MTP.
 struct Q6Packed {
     void *base; const int * ql; const int * qh; const int8_t * sc;
     const sycl::half * d;
     int n_in, n_out;
+    bool owns = true;
 };
 std::unordered_map<const void*, Q6Packed>& q6_packed_registry() {
     static std::unordered_map<const void*, Q6Packed> registry;
     return registry;
 }
 
+inline bool q6_planes_inplace() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_Q6_PLANES_INPLACE");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
+inline bool q6_packed_wide() {
+    if (q6_planes_inplace()) return true;
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_Q6_PACKED_WIDE");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
+
 template <int NCOLS>
 void q6_packed_launch(const Q6Packed &w, const Q81Block *x, float *y,
                       dpct::queue_ptr s) {
+    if (q6_packed_wide()) {
+        const unsigned blocks = unsigned((std::size_t(w.n_out) + WARPS - 1) / WARPS);
+        s->parallel_for<dpct_kernel_name<class native_q6_k_planes_wide, dpct_kernel_scalar<NCOLS>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
+            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                native_mmvq_q6k_wide_kernel<NCOLS, 1, WARP, (int) sizeof(Q6KBlock), true, true>(
+                    nullptr, x, y, w.n_in, w.n_out, w.ql, w.qh, w.sc, w.d);
+            });
+        return;
+    }
     const int grid = (std::min)(w.n_out, q6p_grid());
     if (s26_tsum_on())
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<class native_q6_k_packed_kernel_ee650b,
@@ -2812,8 +3014,7 @@ void q6_packed_launch(const Q6Packed &w, const Q81Block *x, float *y,
                     w.ql, w.qh, w.sc, w.d, x, y, w.n_in, w.n_out, grid);
             });
     } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->/*
@@ -2838,9 +3039,13 @@ deduced. You need to update this code.
 
 bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     auto& registry = q6_packed_registry();
-    if (registry.empty() || g_q6_bypass || (ncols > 1 && !g_multi_exact)) return false;
+    if (registry.empty() || g_q6_bypass) return false;
     const auto found = registry.find(weights);
     if (found == registry.end() || found->second.n_in != n_in || found->second.n_out != n_out) return false;
+    if (ncols > 1 && !g_multi_exact) {
+        if (!found->second.owns) throw std::invalid_argument("in-place Q6 planes require exact multi-column mode");
+        return false;
+    }
     validate_shape(n_in, ncols, 256);
     validate_pointer(x_q8_1);
     validate_pointer(y);
@@ -3051,7 +3256,32 @@ void native_q8_0_packed_register(const void* gguf_weights, const void* packed, i
 
 void native_q8_0_packed_unregister(const void* gguf_weights) { q8_packed_registry().erase(gguf_weights); }
 
+bool native_q6_k_gather_packed_rows(const void* weights, int64_t row_bytes,
+                                  const int32_t* indices, int64_t count, uint8_t* dst, void* stream) {
+    const auto found = q6_packed_registry().find(weights);
+    if (found == q6_packed_registry().end() || found->second.owns) return false;
+    const Q6Packed w = found->second;
+    if (!indices || !dst || count <= 0 || row_bytes != int64_t(w.n_in / 256) * 210)
+        throw std::invalid_argument("invalid in-place Q6 row gather");
+    const size_t total = size_t(count) * size_t(row_bytes);
+    strata::q_of(stream)->parallel_for<dpct_kernel_name<class q6_planes_raw_rows>>(
+        sycl::nd_range<1>(sycl::range<1>((total + 255) / 256 * 256), sycl::range<1>(256)),
+        [=](sycl::nd_item<1> item) {
+            const size_t i = item.get_global_id(0);
+            if (i >= total) return;
+            const size_t within = i % size_t(row_bytes);
+            const size_t block = size_t(indices[i / size_t(row_bytes)]) * size_t(w.n_in / 256) + within / 210;
+            const size_t b = within % 210;
+            if (b < 128) dst[i] = reinterpret_cast<const uint8_t*>(w.ql)[block * 128 + b];
+            else if (b < 192) dst[i] = reinterpret_cast<const uint8_t*>(w.qh)[block * 64 + b - 128];
+            else if (b < 208) dst[i] = uint8_t(w.sc[block * 16 + b - 192]);
+            else dst[i] = reinterpret_cast<const uint8_t*>(w.d)[block * 2 + b - 208];
+        });
+    return true;
+}
+
 bool native_q6_k_packed_enabled() {
+    if (q6_packed_wide()) return true;
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_Q6_PACKED");
         return v && v[0] == '1' && v[1] == '\0';
@@ -3157,6 +3387,8 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
     if (q6_packed_registry().count(weights)) return true;
     const std::size_t nb = std::size_t(n_in / 256) * std::size_t(n_out);
     const std::size_t bytes = nb * sizeof(Q6KBlock);
+    const bool inplace = q6_planes_inplace();
+    if (inplace && !g_multi_exact) return false;
     std::vector<Q6KBlock> host(nb);
     /*
     DPCT1026: The call to cudaGetLastError was removed because this
@@ -3172,6 +3404,7 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
     const std::size_t o_sc = (o_qh + nb * 64 + 255) & ~std::size_t(255);
     const std::size_t o_d = (o_sc + nb * 16 + 255) & ~std::size_t(255);
     const std::size_t total = o_d + nb * 2;
+    if (inplace && total > bytes) return false;  // Never overwrite beyond the original allocation.
     std::vector<uint8_t> packed(total, 0);
     for (std::size_t b = 0; b < nb; ++b) {
         std::memcpy(packed.data() + b * 128, host[b].ql, 128);
@@ -3184,7 +3417,8 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
     DPCT1026: The call to cudaGetLastError was removed because this
     functionality is redundant in SYCL.
     */
-    if (DPCT_CHECK_ERROR(dev = (void *)sycl::malloc_device(
+    if (inplace) dev = const_cast<void*>(weights);
+    else if (DPCT_CHECK_ERROR(dev = (void *)sycl::malloc_device(
                              total, dpct::get_in_order_queue())) != 0) {
         ; return false;
     }
@@ -3200,7 +3434,9 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
         DPCT1026: The call to cudaGetLastError was removed because this
         functionality is redundant in SYCL.
         */
-        sycl::free(dev, dpct::get_in_order_queue());; return false;
+        if (inplace) throw std::runtime_error("in-place Q6 upload failed");
+        sycl::free(dev, dpct::get_in_order_queue());
+        return false;
     }
     auto* base = static_cast<uint8_t*>(dev);
     q6_packed_registry()[weights] =
@@ -3210,9 +3446,10 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
                  reinterpret_cast<const int8_t *>(base + o_sc),
                  reinterpret_cast<const sycl::half *>(base + o_d),
                  n_in,
-                 n_out};
-    std::fprintf(stderr, "strata: STRATA_Q6_PACKED=1 packed the %s (%d x %d, +%.1f MiB)\n", what, n_out, n_in,
-                 total / 1048576.0);
+                 n_out, !inplace};
+    std::fprintf(stderr, "strata: Q6 planes inplace=%d, extra %.1f MiB\n", int(inplace), inplace ? 0.0 : total / 1048576.0);
+    std::fprintf(stderr, "strata: Q6 packed %s (%d x %d, +%.1f MiB)\n", what, n_out, n_in,
+                 inplace ? 0.0 : total / 1048576.0);
     // STRATA_Q6P_SELFTEST=1: bitwise check against the GGUF-layout kernels (1..4 columns) and paired timings
     if (const char* v = std::getenv("STRATA_Q6P_SELFTEST"); v && (v[0] == '1' || v[0] == '2')) {
         dpct::queue_ptr s = &dpct::get_in_order_queue();
@@ -3221,8 +3458,15 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
         options.
         */
         s = dpct::get_current_device().create_queue(true);
+        void* reference_weights = const_cast<void*>(weights);
+        if (inplace) {
+            reference_weights = sycl::malloc_device(bytes, dpct::get_in_order_queue());
+            if (!reference_weights) throw std::bad_alloc();
+            dpct::get_in_order_queue().memcpy(reference_weights, host.data(), bytes).wait();
+        }
         const int nq = n_in / Q8K;
-        std::vector<Q81Block> hx(std::size_t(4) * nq);
+        const int test_columns = q6_packed_wide() ? 8 : 4;
+        std::vector<Q81Block> hx(std::size_t(test_columns) * nq);
         uint32_t r = 12345u;
         for (auto& blk : hx) {
             for (auto& q : blk.qs) { r = r * 1664525u + 1013904223u; q = int8_t(int((r >> 24) & 255u) - 128); }
@@ -3233,18 +3477,18 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
         void *dx = nullptr, *ya = nullptr, *yb = nullptr;
         dx = (void *)sycl::malloc_device(hx.size() * sizeof(Q81Block),
                                          dpct::get_in_order_queue());
-        ya = (void *)sycl::malloc_device(std::size_t(4) * n_out * 4,
+        ya = (void *)sycl::malloc_device(std::size_t(test_columns) * n_out * 4,
                                          dpct::get_in_order_queue());
-        yb = (void *)sycl::malloc_device(std::size_t(4) * n_out * 4,
+        yb = (void *)sycl::malloc_device(std::size_t(test_columns) * n_out * 4,
                                          dpct::get_in_order_queue());
         dpct::get_in_order_queue()
             .memcpy(dx, hx.data(), hx.size() * sizeof(Q81Block))
             .wait();
-        std::vector<float> a(std::size_t(4) * n_out), c(std::size_t(4) * n_out);
+        std::vector<float> a(std::size_t(test_columns) * n_out), c(std::size_t(test_columns) * n_out);
         bool same = true;
-        for (int nc = 1; nc <= 4; ++nc) {
+        for (int nc = 1; nc <= test_columns; ++nc) {
             g_q6_bypass = true;
-            native_q6_k_mmvq(weights, dx, (float*) ya, n_in, n_out, nc, s);
+            native_q6_k_mmvq(reference_weights, dx, (float*) ya, n_in, n_out, nc, s);
             g_q6_bypass = false;
             native_q6_k_mmvq(weights, dx, (float*) yb, n_in, n_out, nc, s);
             s->wait();
@@ -3265,7 +3509,7 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
                     const bool cand = (pass == 0) == (k % 2 == 1);
                     g_q6_bypass = !cand;
                     dpct::sync_barrier(e0, s);
-                    for (int it = 0; it < 5; ++it) native_q6_k_mmvq(weights, dx, (float*) (cand ? yb : ya), n_in, n_out, nc, s);
+                    for (int it = 0; it < 5; ++it) native_q6_k_mmvq(cand ? weights : reference_weights, dx, (float*) (cand ? yb : ya), n_in, n_out, nc, s);
                     dpct::sync_barrier(e1, s);
                     e1->wait_and_throw();
                     float ms = 0;
@@ -3283,8 +3527,8 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
             std::fprintf(stderr, "strata: Q6_K packed self-test %s ncols %d: GGUF %.1f us (%.1f-%.1f), packed %.1f us "
                          "(%.1f-%.1f), 11 paired samples\n", what, nc, tb[5], tb[0], tb[10], tc[5], tc[0], tc[10]);
         }
-        std::fprintf(stderr, "strata: Q6_K packed self-test %s: outputs %s (1-4 columns)\n", what,
-                     same ? "BITWISE EQUAL" : "DIFFER");
+        std::fprintf(stderr, "strata: Q6_K packed self-test %s: outputs %s (1-%d columns)\n", what,
+                     same ? "BITWISE EQUAL" : "DIFFER", test_columns);
         if (v[0] == '2') {   // grid sweep of the packed kernel
             for (int grid : {160, 320, 640, 1280, 2560, 5120, 20480}) {
                 g_q6p_grid_override = grid;
@@ -3311,12 +3555,34 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
             }
             g_q6p_grid_override = 0;
         }
+        if (inplace) {
+            const int32_t chosen[3] = {0, n_out / 2, n_out - 1};
+            const size_t row_bytes = size_t(n_in / 256) * 210;
+            auto* di = sycl::malloc_device<int32_t>(3, dpct::get_in_order_queue());
+            auto* dr = sycl::malloc_device<uint8_t>(3 * row_bytes, dpct::get_in_order_queue());
+            if (!di || !dr) throw std::bad_alloc();
+            dpct::get_in_order_queue().memcpy(di, chosen, sizeof(chosen)).wait();
+            native_q6_k_gather_packed_rows(weights, int64_t(row_bytes), di, 3, dr, nullptr);
+            std::vector<uint8_t> gathered(3 * row_bytes);
+            dpct::get_in_order_queue().memcpy(gathered.data(), dr, gathered.size()).wait();
+            bool gather_same = true;
+            for (int i = 0; i < 3; ++i)
+                gather_same = gather_same && std::memcmp(gathered.data() + i * row_bytes,
+                    reinterpret_cast<const uint8_t*>(host.data()) + size_t(chosen[i]) * row_bytes, row_bytes) == 0;
+            same = same && gather_same;
+            std::fprintf(stderr, "strata: Q6 in-place raw gather: %s (first/middle/last rows)\n", gather_same ? "BITWISE EQUAL" : "DIFFER");
+            sycl::free(di, dpct::get_in_order_queue()); sycl::free(dr, dpct::get_in_order_queue());
+            sycl::free(reference_weights, dpct::get_in_order_queue());
+        }
         dpct::destroy_event(e0); dpct::destroy_event(e1);
         sycl::free(dx, dpct::get_in_order_queue());
             sycl::free(ya, dpct::get_in_order_queue());
             sycl::free(yb, dpct::get_in_order_queue());
         dpct::get_current_device().destroy_queue(s);
-        if (!same) { native_q6_k_unpack(weights); return false; }
+        if (!same) {
+            if (inplace) dpct::get_in_order_queue().memcpy(const_cast<void*>(weights), host.data(), bytes).wait();
+            native_q6_k_unpack(weights); return false;
+        }
     }
     return true;
 }
@@ -3331,12 +3597,14 @@ void native_q6_k_unpack(const void* weights) {
     auto& registry = q6_packed_registry();
     const auto found = registry.find(weights);
     if (found == registry.end()) return;
-    sycl::free(found->second.base, dpct::get_in_order_queue());
+    if (found->second.owns) sycl::free(found->second.base, dpct::get_in_order_queue());
     registry.erase(found);
 }
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 void native_mmvq_set_q6k_wide(bool on) { g_q6k_wide = on; }
+void native_mmvq_set_q6k_fast(bool on) { g_q6k_fast.store(on ? 1 : 0); }
+void native_mmvq_set_k4_fast(bool on) { g_k4_fast.store(on ? 1 : 0); }
 void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                                 void* stream) {
     const auto s = strata::q_of(stream);
@@ -3365,8 +3633,7 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     const int n_total = n_in * ncols;
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<
@@ -3394,8 +3661,7 @@ void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_
     const int n_total = n_in * ncols;
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(
             ((sycl::queue *)(strata::q_of(stream)))
                 ->get_device(),
@@ -3425,7 +3691,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    if (try_wide<WideQ5K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
+    if (k4_fast() ? try_wide<WideQ5KFast>(weights, x_q8_1, y, n_in, n_out, ncols, stream) : try_wide<WideQ5K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     STRATA_WAVE_MMVQ(Q5KTraits)
     if (ncols > 1) {
         launch_multi<Q5KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -3444,8 +3710,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
@@ -3464,8 +3729,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<class native_q5_k_mmvq_kernel_938b09,
@@ -3520,8 +3784,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<
                 dpct_kernel_name<class native_q2_0_mmvq_kernel_dec305,
@@ -3539,8 +3802,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<dpct_kernel_name<class native_q2_0_mmvq_kernel_ef5f5c,
                                          dpct_kernel_scalar<false>>>(
@@ -3593,8 +3855,7 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<
                 dpct_kernel_name<class native_q3_k_mmvq_kernel_208be9,
@@ -3612,8 +3873,7 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<dpct_kernel_name<class native_q3_k_mmvq_kernel_926817,
                                          dpct_kernel_scalar<false>>>(
@@ -3669,8 +3929,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
         {
             iq4nl_values.init(*s);
 
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->submit([&](sycl::handler &cgh) {
                 auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
@@ -3696,8 +3955,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
         */
         iq4nl_values.init(*s);
 
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->submit([&](sycl::handler &cgh) {
             auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
@@ -3739,7 +3997,7 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    if (try_wide<WideQ4K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
+    if (k4_fast() ? try_wide<WideQ4KFast>(weights, x_q8_1, y, n_in, n_out, ncols, stream) : try_wide<WideQ4K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     STRATA_WAVE_MMVQ(Q4KTraits)
     if (ncols > 1) {
         launch_multi<Q4KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -3758,8 +4016,7 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
@@ -3778,8 +4035,7 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<class native_q4_k_mmvq_kernel_b29f4f,
@@ -3864,8 +4120,7 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
         {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+            auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             s->parallel_for<
                 dpct_kernel_name<class native_q6_k_mmvq_kernel_4d887f,
@@ -3883,8 +4138,7 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
         s->parallel_for<dpct_kernel_name<class native_q6_k_mmvq_kernel_19484e,
                                          dpct_kernel_scalar<false>>>(
@@ -3944,8 +4198,7 @@ void q8_0_pair_launch(const Q80Block *w1, const Q80Block *w2, const Q81Block *x,
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<
@@ -3966,8 +4219,7 @@ void q8_0_pair_launch(const Q80Block *w1, const Q80Block *w2, const Q81Block *x,
     info::device::max_work_group_size. Adjust the work-group size if needed.
     */
     {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<

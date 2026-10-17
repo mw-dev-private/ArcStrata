@@ -76,6 +76,14 @@ int GgufExpertSource::fd_of(int64_t layer, int role, std::string& err) {
     return fd;
 }
 
+const uint8_t* GgufExpertSource::blob_stable(int64_t layer, int64_t expert) {
+    // Only the USM host mirror is stable: it lives as long as the source is open.  A ring slot is not - the prompt
+    // path's stager threads call blob() thousands of times per chunk and recycle through the ring underneath a pointer
+    // taken here (the design note above blob()).  null: the caller keeps that expert on the GPU.
+    if (mirror_ptr_.empty() || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return nullptr;
+    return mirror_ptr_[(size_t) (layer * n_expert_ + expert)];
+}
+
 const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_ || ring_.empty()) return nullptr;
     if (!mirror_ptr_.empty()) {

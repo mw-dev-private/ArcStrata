@@ -135,6 +135,9 @@ public:
     /// immediately and nothing is retained.  A CACHING source must return pointers into the cache, not into a
     /// reused staging buffer - otherwise the pool would read the next expert's bytes while computing this one.
     virtual const uint8_t* blob(int64_t layer, int64_t expert) = 0;
+    /// A blob pointer that stays valid (not recycled) for as long as the source is open: for a copy that runs
+    /// asynchronously long after the call (the adaptive tier's swap-ins, the prefill's CPU share).  Defaults to `blob`.
+    virtual const uint8_t* blob_stable(int64_t layer, int64_t expert) { return blob(layer, expert); }
 
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
@@ -383,6 +386,9 @@ struct ExpertDispatch {
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
+    bool tail_skip_allowed = false;  ///< enabled by the single-stream startup gates only
+    int64_t tail_skipped = 0;       ///< skipped routed entries
+    int64_t tail_experts = 0;       ///< skipped distinct layer/window experts
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).
     PeerExperts* peer = nullptr;
@@ -408,6 +414,9 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// Plan v0.3 P6: the pool for a verify window of `n_tok` tokens.  `x_f` is (n_tok, n_embd), `ids` (n_tok, k) and
 /// `out` (n_tok * k, n_embd).  Each distinct missed expert is computed once for all the tokens routed to it;
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
+int tail_skip_rank();
+void set_tail_skip_rank(int r);
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);
 

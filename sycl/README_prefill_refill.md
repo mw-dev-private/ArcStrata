@@ -1,0 +1,11 @@
+# Opt-in asynchronous prefill loan refill
+
+The SYCL-only `STRATA_PREFILL_REFILL_ASYNC=1` path batches copies that restore expert-cache slots borrowed by prefill. CLI and server loan refills use it; other cache-fill callers keep their existing behavior. Unset or `0` keeps the original path. `STRATA_REFILL_BLOCKING` takes precedence.
+
+Up to 16 owned USM host buffers (at most 64 MiB total; 40.62 MiB on the tested IQ3_S model) keep DMA sources alive until their batch completes. GGUF slices are read directly into these buffers with the existing `GgufExpertSource::read_into`; mirrored or other sources are copied into owned buffers. No extra device buffer or cache reserve is allocated. Every batch drains before reuse, and error unwinding drains before freeing the host buffers.
+
+Add `STRATA_PREFILL_REFILL_VERIFY=1` only for correctness runs. It reads back every restored slot and compares every weight byte to its owned source. A mismatch fails the request. Readback time must not be counted as normal performance.
+
+Verified on B70, IQ3_S, Tail7/Shareauto/NativeGraph1/GDN0/PCIe0.35, no batch: all 542 slots at 2k and 6,296 slots at 32k are bitwise equal. Three alternating frozen 32k/640 pairs (two warmups excluded) give median prefill 21.1104→20.4182 s; refill 2.3619→1.6855 s, both 13,423 cache slots. Decode 63.4568→63.6721 tok/s is treated as unchanged. This is one workload, not a general speed guarantee. An earlier implementation with a redundant host-to-host copy had no gain and was replaced.
+
+Private build and safe GPU wrappers live in `/home/markus/strata/istrata-replay-v2`: `probe_refill_async.py`, `sweep_refill_async.py`, `probe_refill_server.py`. They stop :8000 cleanly, use timeouts and restore the current production snapshot. Do not run alongside production or another GPU test. Since 2026-10-15, production uses a byte-identical release copy at `/home/markus/strata/prod/bin/strata-refill-637091a` with Async1/Verify0. A short full-server off/on test gave cold prefill −2.77%, incremental prefill +3.81% (no gain established), aggregate prefill −1.95% and unchanged decode. The original production config was backed up; this worktree remains the source checkout. Multi-GPU operation and non-GGUF sources were not GPU-tested.
