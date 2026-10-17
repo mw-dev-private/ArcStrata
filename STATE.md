@@ -11,3 +11,8 @@ Erledigt GPU-Zwischenstand:104/1500-Token-Fälle je64Logitpositionen bit-identis
 Naechster Schritt:32k-Parität, dann rotierte Timingpaare; Restore folgt automatisch.
 Erledigt: Alle drei Logitfälle bit-identisch (192Positionen×248320Logits),KL0.
 Naechster Schritt: Rotierte32k-Decode-Timingpaare mit CPU_SHARE=auto; dann Restore und Kurzprefill-Serververgleich.
+
+Delta Owner: Keine weiteren Vergleiche;1.45 aktivieren und laufen lassen.32k-Vergleich schon abgeschlossen, alte Produktion restauriert. Kurzprefill nur Dry-run, kein Vergleich gestartet. Deployment mit unveränderter Modell-/Env-Konfiguration und expliziten Legacy-Generationsdefaults läuft.
+Naechster Schritt: Nur Health/Identität prüfen und aktive Version persistieren.
+Erledigt:1.45 live, Health geladen, neuer Server-CWD/Config/Engine-Hash geprüft; Engine-Env und Originalconfig unverändert. start144/start145 wählen server_repo aus Config, Default jetzt1.45. Keine weiteren Vergleiche oder Inferenzrequests nach Owner-Delta.
+Naechster Schritt: Normalbetrieb auf1.45; kein weiterer Test geplant.
