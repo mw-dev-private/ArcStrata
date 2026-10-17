@@ -7,9 +7,15 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace strata::core {
 namespace {
+using CkptClock = std::chrono::steady_clock;
+bool ckpt_detail_on() { static const bool on = std::getenv("STRATA_CKPT_DETAIL") != nullptr; return on; }
+double ckpt_ms(CkptClock::time_point a, CkptClock::time_point b) { return std::chrono::duration<double, std::milli>(b-a).count(); }
 using conversation_detail::add;
 using conversation_detail::product;
 
@@ -167,8 +173,11 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
+    const bool detail = ckpt_detail_on();
+    const auto t0 = detail ? CkptClock::now() : CkptClock::time_point{};
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+    const auto t1 = detail ? CkptClock::now() : CkptClock::time_point{};
     if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
         !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
     for (size_t j = 0; j < layers; ++j) {
@@ -176,6 +185,10 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
         if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
             !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
             !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+    }
+    if (detail) {
+        const auto t2 = CkptClock::now();
+        std::fprintf(stderr, "strata ckpt detail save tokens=%zu bytes=%zu resize_ms=%.4f copy_ms=%.4f\n", c.ids.size(), c.gdn.size()+c.ple.size()+c.tails.size()+c.dead.size()+c.block_pos.size(), ckpt_ms(t0,t1), ckpt_ms(t1,t2));
     }
     return true;
 }
@@ -220,8 +233,11 @@ bool conversation_checkpoint_unstage(ConversationCheckpoint& c, const void* stag
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
+    const bool detail = ckpt_detail_on();
+    const auto t0 = detail ? CkptClock::now() : CkptClock::time_point{};
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+    const auto t1 = detail ? CkptClock::now() : CkptClock::time_point{};
     const auto* p = static_cast<const uint8_t*>(staging);
     if (p == nullptr) return fail(error, "missing checkpoint staging");
     auto take = [&](void* dst, size_t bytes) {
@@ -234,6 +250,10 @@ bool conversation_checkpoint_unstage(ConversationCheckpoint& c, const void* stag
         take(c.tails.data() + j * z.tail, z.tail);
         take(c.dead.data() + j * z.dead, z.dead);
         take(c.block_pos.data() + j * z.block_pos, z.block_pos);
+    }
+    if (detail) {
+        const auto t2 = CkptClock::now();
+        std::fprintf(stderr, "strata ckpt detail unstage tokens=%zu bytes=%zu resize_ms=%.4f copy_ms=%.4f\n", c.ids.size(), c.gdn.size()+c.ple.size()+c.tails.size()+c.dead.size()+c.block_pos.size(), ckpt_ms(t0,t1), ckpt_ms(t1,t2));
     }
     return true;
 }

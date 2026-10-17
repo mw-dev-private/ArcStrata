@@ -7849,6 +7849,7 @@ int main(int argc, char **argv) try {
         };
         const bool ckpt_stage_on = [] { const char* v = std::getenv("STRATA_CKPT_STAGE"); return v && std::atoi(v) == 1; }();
         const bool ckpt_check = std::getenv("STRATA_CKPT_STAGE_CHECK") != nullptr;
+        const bool ckpt_detail = std::getenv("STRATA_CKPT_DETAIL") != nullptr;
         const bool ckpt_timing = std::getenv("STRATA_CKPT_TIMING") != nullptr;
         auto host_free = [](void* p) { if (p) sycl::free(p, dpct::get_in_order_queue()); };
         std::unique_ptr<void, decltype(host_free)> ckpt_buffer(nullptr, host_free);
@@ -7860,6 +7861,8 @@ int main(int argc, char **argv) try {
         int64_t pending_len = -1;
         bool pending_tail = false;
         auto keep_checkpoint = [&](ConvCheckpoint&& c, int64_t L, bool as_tail) {
+            const auto kt0 = ckpt_detail ? Clock::now() : Clock::time_point{};
+            const size_t count_before = checks.size();
             c.used = ++check_clock;
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
                 const int64_t old_tail = tail_ckpt_len;
@@ -7886,15 +7889,19 @@ int main(int argc, char **argv) try {
                     stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get());
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
+            if (ckpt_detail) std::fprintf(stderr, "strata ckpt detail keep tokens=%lld before=%zu after=%zu ms=%.4f\n", (long long)L,count_before,checks.size(),std::chrono::duration<double,std::milli>(Clock::now()-kt0).count());
         };
         auto finish_checkpoint = [&]() -> bool {
             if (pending_len < 0) return true;
+            const auto ft0 = ckpt_detail ? Clock::now() : Clock::time_point{};
+            const auto finish_len = pending_len;
             std::string error;
             if (!strata::core::conversation_checkpoint_unstage(pending_checkpoint, ckpt_buffer.get(), ss, g, error)) {
                 std::fprintf(stderr, "strata checkpoint unstage: %s\n", error.c_str()); return false;
             }
             keep_checkpoint(std::move(pending_checkpoint), pending_len, pending_tail);
             pending_checkpoint = ConvCheckpoint{}; pending_len = -1;
+            if (ckpt_detail) std::fprintf(stderr, "strata ckpt detail finish tokens=%lld ms=%.4f\n", (long long)finish_len,std::chrono::duration<double,std::milli>(Clock::now()-ft0).count());
             return true;
         };
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false, bool stage = false) -> bool {
@@ -7919,7 +7926,10 @@ int main(int argc, char **argv) try {
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else if (stage && ckpt_buffer && pending_len < 0) {
                 const auto t0 = Clock::now();
-                if (!gpu_sync_ok() || !strata::core::conversation_checkpoint_stage(ckpt_buffer.get(), nullptr, ss, g, (size_t)L, ckpt_why)) return false;
+                if (!gpu_sync_ok()) return false;
+                const auto sync_end = ckpt_detail ? Clock::now() : Clock::time_point{};
+                if (!strata::core::conversation_checkpoint_stage(ckpt_buffer.get(), nullptr, ss, g, (size_t)L, ckpt_why)) return false;
+                if (ckpt_detail) std::fprintf(stderr, "strata ckpt detail syncstage tokens=%lld sync_ms=%.4f copy_ms=%.4f\n", (long long)L,std::chrono::duration<double,std::milli>(sync_end-t0).count(),std::chrono::duration<double,std::milli>(Clock::now()-sync_end).count());
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 if (ckpt_check) {
                     ConvCheckpoint ref, staged; ref.ids = c.ids; staged.ids = c.ids;
@@ -7932,7 +7942,10 @@ int main(int argc, char **argv) try {
                 return true;
             } else {
                 const auto t0 = Clock::now();
-                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
+                if (!gpu_sync_ok()) return false;
+                const auto sync_end = ckpt_detail ? Clock::now() : Clock::time_point{};
+                if (!checkpoint_save(c, ss, g)) return false;
+                if (ckpt_detail) std::fprintf(stderr, "strata ckpt detail sync tokens=%lld ms=%.4f\n", (long long)L,std::chrono::duration<double,std::milli>(sync_end-t0).count());
                 if (ckpt_timing) std::fprintf(stderr, "strata checkpoint save mode=baseline tokens=%lld ms=%.3f\n", (long long)L, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const strata::core::OnDevice on(st->dev);
