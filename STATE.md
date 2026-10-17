@@ -20,3 +20,5 @@ Naechster Schritt: Normalbetrieb auf1.45; kein weiterer Test geplant.
 Auftrag: Optionales Checkpoint-Staging portieren und B70-Gewinn prüfen. Backups im Auftrag-Workspace work/checkpoint-backup. Opt-in-Pfad mit Payload-Vergleich und Timing implementiert; Default unverändert. Nächster Schritt: Build, dann kontrollierter Vergleich mit Restore.
 
 Erledigt: Build erfolgreich;1bd1a20. Q-Arm auf B70: vier Turn-Checkpoints bytegenau identisch zur bisherigen Sicherung, Folgeanfragen erfolgreich. Staging4,5–4,9ms; noch kein Vergleichsergebnis. ABBA-Timing läuft unter results/short_prefill_20261017_155538. Nächster Schritt: A/B abschliessen und Produktion restaurieren.
+
+2026-10-17 Checkpoint-Staging-Test abgeschlossen:4Payloads bytegenau,48Timing-Folgefragen ABBA. Sicherung43,683->4,653ms;104-TTFT8k803,7->780,9ms,80k901,9->884,1ms, hohe Streuung/variableTokenzahl. Nachgelagerte Kopie verschiebt wahrscheinlich Arbeit zur nächsten Anfrage. Produktion0713d52 RESTORE VERIFIED. Brain checkpoint-staging-b70-test-2026-10-17.md; Bericht outputs/Checkpoint-Staging-B70.md im Auftrag-Workspace. Nächster Schritt: keine automatische Aktivierung, optionaler Kandidat bleibt aus.
