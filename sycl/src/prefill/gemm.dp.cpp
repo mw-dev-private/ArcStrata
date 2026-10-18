@@ -17,6 +17,9 @@
 
 #include <algorithm>
 #include <atomic>
+#ifdef STRATA_ONEDNN_DOWN
+#include "onednn_down.hpp"
+#endif
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 // The HIP compatibility shim maps CUDA shuffle spellings to Strata helpers.
@@ -836,6 +839,9 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+#ifdef STRATA_ONEDNN_DOWN
+    if(onednn_down::run(*strata::q_of(stream_),X,W,Y,T,N,K,ldy,beta))return;
+#endif
 #ifdef STRATA_USE_HIP
     // #313 (opt-in STRATA_WMMA_GEMM=1): RDNA3 / RDNA3.5 WMMA dense GEMM, before hipBLASLt (falls through when false)
     static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
