@@ -21,6 +21,8 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure
 // and the logit dump.
 
+namespace strata::prefill { void gemm_onednn_report(); }
+
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
@@ -12018,6 +12020,7 @@ int main(int argc, char **argv) try {
                              remote_experts[(size_t) r].ms_begin() - begin_before[(size_t) r],
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
         }
+        strata::prefill::gemm_onednn_report();
         save_profile("exit");   // #477: QUIT, or the server closed stdin
         // SYCL port: the requests are done and their output written; leave without unwinding the GPU objects (the OS
         // reclaims them). Their destructors ran against a runtime already shutting down and aborted (exit 139).

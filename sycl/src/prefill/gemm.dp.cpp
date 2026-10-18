@@ -57,6 +57,11 @@
 #endif
 
 namespace strata::prefill {
+void gemm_onednn_report() {
+#ifdef STRATA_ONEDNN_DOWN
+    if(onednn_down::flag("STRATA_DNN_DOWN_SHAPES") || onednn_down::flag("STRATA_DNN_DOWN_CHECK"))onednn_down::statistics().report();
+#endif
+}
 namespace {
 #if defined(__HIPCC__)
 // Y's rows, written by an FP16-out GEMM as FP16 at the start of each FP32 row (ldc = 2 ldy halves), widened in place.

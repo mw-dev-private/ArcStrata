@@ -34,3 +34,5 @@ Erledigt: Build erfolgreich;1bd1a20. Q-Arm auf B70: vier Turn-Checkpoints bytege
 2026-10-17 Pool produktiv aktiviert: immutable strata-v0145-fast-pool-038dadd, bestehende Config plus STRATA_CKPT_POOL=1; Staging/Diagnose aus. Live-SHA entspricht getesteter Binary; übrige Umgebung unverändert; Health und zwei API-Turns OK/stop. Backup work/pool-activation-20261017-165159, kein Rollback nötig. Brain checkpoint-pool-live-2026-10-17.md und v0145-production-port aktualisiert. Nächster Schritt: Normalbetrieb; keine weiteren Tests.
 
 2026-10-18 OptionalenSYCL-oneDNN-Down-Pfad fürM1–16 implementiert;CMakeopt-in/Runtimeflagdefaultoff,gecachtePrimitive+Memoryobjekte,actual-input-MKL-Vergleich undGPU-f16Shapezählerseparat. BackupimAuftragwork/onednn-integration-backup. NächsterSchritt:Build,Prüfung,begrenzterA/BmitRestore.
+
+2026-10-18 ErsteoneDNN-Engine-Qualitätsreihe beendet,alleRequestsbeantwortet,aberSummaryfehltewegenstd::_ExitstattDestruktor. RunnerstopptvorTiming,RESTORE VERIFIED. ExpliziteSummaryvorQUitExit ergänzt,Rebuildläuft. Brain onednn-down-integration-2026-10-18.md. NächsterSchritt:Summaryprüfen,dannTiming.

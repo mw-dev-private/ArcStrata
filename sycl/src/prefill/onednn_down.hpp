@@ -12,11 +12,12 @@ inline bool flag(const char* name) { const char* p=std::getenv(name); return p &
 struct Stats {
     std::map<std::tuple<int64_t,int64_t,int64_t>,uint64_t> shapes;
     uint64_t calls=0,checks=0,nonexact=0; double max_abs=0,max_rel=0;
-    ~Stats() {
+    void report() const {
         if(calls || checks) std::fprintf(stderr,"strata onednn down calls=%llu checks=%llu nonexact=%llu max_abs=%.9g max_rel=%.9g\n",(unsigned long long)calls,(unsigned long long)checks,(unsigned long long)nonexact,max_abs,max_rel);
         for(const auto& [key,n]:shapes) std::fprintf(stderr,"strata gpu f16 shape M=%lld N=%lld K=%lld calls=%llu\n",(long long)std::get<0>(key),(long long)std::get<1>(key),(long long)std::get<2>(key),(unsigned long long)n);
     }
 };
+inline Stats& statistics() { thread_local Stats s; return s; }
 struct Entry {
     dnnl::matmul op;
     dnnl::memory x,w,y;
@@ -51,7 +52,7 @@ inline bool run(sycl::queue& q,const uint16_t* X,const uint16_t* W,float* Y,int6
     static const bool shapes=flag("STRATA_DNN_DOWN_SHAPES");
     static const bool check=flag("STRATA_DNN_DOWN_CHECK");
     if(!enabled && !shapes)return false;
-    thread_local Stats stats;
+    auto& stats=statistics();
     if(shapes)++stats.shapes[{M,N,K}];
     if(!enabled || N!=2560 || K!=640 || M<1 || M>16 || beta!=0 || ldy!=N)return false;
     if(!q.has_property<sycl::property::queue::in_order>())throw std::runtime_error("oneDNN down requires in-order queue");
