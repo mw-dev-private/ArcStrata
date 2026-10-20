@@ -95,9 +95,18 @@ class Tokenizer:
             parts = m.split(" ")
             if len(parts) != 2:
                 raise ValueError("merge %d is not a pair: %r" % (i, m))
-            if parts[0] not in self.ids or parts[1] not in self.ids:
+            v0 = self.ids.get(parts[0])
+            v1 = self.ids.get(parts[1])
+            if v0 is None or v1 is None:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
-            self.ranks[(parts[0], parts[1])] = i
+            # Optimizer 2 (2026-10-20): key the pair with the vocabulary's OWN string object -
+            # tokens[v] is exactly what self.ids was built from, so this costs no extra table and the
+            # split fragments die with the loop.  Measured on the pack, fresh processes, 3 alternating
+            # runs each: 453,001 distinct rank-key string objects (65,178 values) become 65,178 - all
+            # 495,174 key slots share vocab objects - and RSS after load drops 151.8 -> 123.1 MB
+            # (-28.7 MB).  Load time within noise (~210-225 ms both).  Dict lookups match by equality
+            # either way, so ranks behave identically.
+            self.ranks[(tokens[v0], tokens[v1])] = i
         self._re = regex.compile(QWEN35_PATTERN)
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
