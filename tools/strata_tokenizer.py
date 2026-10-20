@@ -45,6 +45,16 @@ def bytes_to_unicode() -> dict[int, str]:
 BYTE_TO_UNICODE = bytes_to_unicode()
 UNICODE_TO_BYTE = {v: k for k, v in BYTE_TO_UNICODE.items()}
 
+# The same map as a str.translate table, built once (optimizer 1, 2026-10-20): the byte mapping of a
+# pre-tokenizer piece is piece.encode("utf-8").decode("latin1").translate(this) - latin1 hands over each
+# byte as the codepoint with the same number, and the table covers every codepoint 0..255, so the
+# result is character-for-character the "".join(BYTE_TO_UNICODE[b] for b in ...) it replaces (asserted
+# on the real pieces of the pack's corpora).  Measured, private branch, CPython 3.14.4, real pack:
+# the mapping alone is 52-68% faster across the piece distributions (7.1 -> 2.3 ms over the diverse
+# identifiers' 12k pieces); end to end it is ~1% of a cold diverse encode - BPE still dominates - and
+# warm paths never reach this line (cached pieces).  Not a request-level win on its own.
+BYTE_TRANSLATION = str.maketrans(BYTE_TO_UNICODE)
+
 # The `qwen35` pre-tokenizer, transcribed from the ORACLE rather than from the family resemblance:
 # `.ref/llama.cpp/src/llama-vocab.cpp` L396, `case LLAMA_VOCAB_PRE_TYPE_QWEN35`.  The commented-out line
 # above it is the `tokenizer.json` original, and llama.cpp's active version differs from it - it spells the
@@ -226,7 +236,7 @@ class Tokenizer:
         for piece in self._re.findall(text):
             got = cache.get(piece)
             if got is None:
-                mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
+                mapped = piece.encode("utf-8").decode("latin1").translate(BYTE_TRANSLATION)
                 got = []
                 for tok in self._bpe(mapped):
                     i = self.ids.get(tok)
