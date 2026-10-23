@@ -10,8 +10,9 @@ used from the next start on.
 from __future__ import annotations
 
 import json
+import math
 import os
-import shutil
+import stat
 from pathlib import Path
 
 # (key, kind, help).  kind: "bool", "int>=0", "num>=0", ("enum", values), "names", or ("sampling", check) for a key
@@ -71,8 +72,16 @@ def view(cfg: dict, path: str | Path) -> dict:
 
 
 def _number(key, v, whole=False, lo=0.0, hi=None, lo_open=False):
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or (whole and v != int(v)) or \
-            (v <= lo if lo_open else v < lo) or (hi is not None and v > hi):
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool)
+    if ok and isinstance(v, float) and not math.isfinite(v):
+        ok = not whole and hi is None      # NaN / infinity: no whole number, and none meets an upper bound (NaN slips past every
+                                           # comparison, infinity made int() raise); an open-ended number is left as it was
+    if ok and not whole and isinstance(v, int):
+        try:
+            float(v)                       # the next start reads these as floats: a whole number beyond float range would stop it
+        except OverflowError:
+            ok = False
+    if not ok or (whole and v != int(v)) or (v <= lo if lo_open else v < lo) or (hi is not None and v > hi):
         rng = f"{'more than' if lo_open else 'at least'} {lo:g}" + (f" and at most {hi:g}" if hi is not None else "")
         raise ValueError(f"{key}: expected a {'whole ' if whole else ''}number, {rng}, not {v!r}")
     return int(v) if whole else v
@@ -161,14 +170,43 @@ def apply(cfg: dict, changes: dict) -> tuple[dict, list[str]]:
     return new, changed
 
 
+def _write_private(path: Path, data: bytes, mode: int) -> None:
+    """A new file, never readable by more than `mode` (the config's own) at any moment: created 0600 and exclusive, set to
+    `mode` before the first byte is written.  A leftover of an earlier failed save is replaced."""
+    path.unlink(missing_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    except BaseException:
+        os.close(fd)
+        path.unlink(missing_ok=True)
+        raise
+    os.close(fd)
+
+
 def save(path: str | Path, cfg: dict) -> Path:
-    """The config written whole (a temporary file moved over the old one), the earlier one kept as <name>.bak."""
-    path = Path(path)
+    """The config written whole (a temporary file moved over the old one), the earlier one kept as <name>.bak.  The config can hold
+    the api_key: the temporary file and the backup are created private and take the config's own permissions before any byte is
+    written, so no copy is ever more readable than the config - also when a step fails (a failed save leaves the config as it was,
+    no stray temporary file, and the earlier backup intact)."""
+    path = Path(os.path.realpath(path))                # a link to the config stays a link: its target is the file that changes
+    mode = stat.S_IMODE(os.stat(path).st_mode)
     bak = path.with_name(path.name + ".bak")
-    shutil.copyfile(path, bak)
+    bak_tmp = path.with_name(path.name + ".bak.tmp")
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        _write_private(bak_tmp, path.read_bytes(), mode)
+        _write_private(tmp, json.dumps(cfg, indent=1).encode("utf-8"), mode)
+        os.replace(bak_tmp, bak)                       # the backup is complete before it replaces the earlier one
+        os.replace(tmp, path)
+    except BaseException:
+        for f in (tmp, bak_tmp):
+            f.unlink(missing_ok=True)
+        raise
     return bak
 
 

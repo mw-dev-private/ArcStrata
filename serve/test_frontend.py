@@ -219,11 +219,11 @@ class QuotedToolCallCloser(unittest.TestCase):
 
     def encode(self, role, text):
         from serve.frontend import mark_think_literals, unmark_think_literals
-        marked, _, changed = mark_think_literals([{"role": role, "content": text}], None, self.tags)
+        marked, _, changed, lit = mark_think_literals([{"role": role, "content": text}], None, self.tags)
         content = marked[0]["content"]
         if isinstance(content, list):
             content = "".join(x["text"] for x in content)
-        prompt, plain = unmark_think_literals(content, self.tags)
+        prompt, plain = unmark_think_literals(content, lit or self.tags)
         return self.tok.encode(prompt, parse_special=True, plain=plain), changed
 
     def special(self, tag):
@@ -281,12 +281,12 @@ class QuotedToolCallCloser(unittest.TestCase):
         from serve.frontend import mark_think_literals
         msgs = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"},
                 {"role": "user", "content": "<tool_response>\nok\n</tool_response>"}]
-        marked, _, changed = mark_think_literals(msgs, None, self.tags)
+        marked, _, changed, _lit = mark_think_literals(msgs, None, self.tags)
         self.assertTrue(changed)
         self.assertTrue(marked[2]["content"].startswith("<tool_response>"))
         self.assertTrue(marked[2]["content"].endswith("</tool_response>"))
         # a question that only mentions the pair is still marked through
-        marked, _, _ = mark_think_literals([{"role": "user", "content": "what is <tool_response>?"}], None, self.tags)
+        marked, _, _ = mark_think_literals([{"role": "user", "content": "what is <tool_response>?"}], None, self.tags)[:3]
         self.assertNotIn("<tool_response>", marked[0]["content"])
 
     def test_user_text_stays_text(self):
@@ -340,3 +340,288 @@ class FencedJsonCallInWrapper(unittest.TestCase):
         other = [{"name": "other", "parameters": {}}]
         calls, text = self.run_parser(raw, len(raw), False, tools=other)
         self.assertEqual((calls, text), ([], raw))
+
+
+class ThinkAndToolTokenizer(ByteTokenizer):
+    """ByteTokenizer with the type-4 literals of the real vocabulary matched even without parse_special."""
+    SPECIALS = ByteTokenizer.SPECIALS + ["<think>", "</think>", "<tool_call>", "</tool_call>",
+                                         "<tool_response>", "</tool_response>"]
+    ALWAYS = ("<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>")
+
+
+def _service_prompt(service, messages, tools=None, kwargs=None):
+    """The rendered prompt behind encode_prompt, recovered from ByteTokenizer's one-id-per-byte ids."""
+    ids = service.encode_prompt(messages, tools, kwargs if kwargs is not None else {})
+    return b"".join(bytes((i,)) for i in ids if i < 256).decode("utf-8", errors="replace")
+
+
+THINK_CLOSE = "<" + "/" + "think" + ">"
+
+
+class PrivateUseMarkerCollisions(unittest.TestCase):
+    """Audit 2026-10-20 (C): the #537 marks are private-use characters (LITERAL_TAGS).  An ORIGINAL private-use
+    character in a message survived as ordinary text on the unmarked fast path, but once another quoted literal took
+    the request onto the marking path, unmark rewrote EVERY mark it found - the user's own character included
+    ("Keep \\U000F0E01 unchanged; quote
+</think>
+
+." came back as "Keep <think> unchanged"). Marking now relocates
+    marks that collide with the request's own text; original text is never rewritten, other requests are unchanged."""
+
+    def setUp(self):
+        self.template = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
+        self.tok = ThinkAndToolTokenizer()
+        self.service = Service(MockEngine(self.tok, "ok"), self.tok, self.template)
+
+    def test_reproducer_mark_survives_quoted_literal(self):
+        from serve.frontend import LITERAL_TAGS
+        for tag, mark in LITERAL_TAGS.items():
+            with self.subTest(tag=tag):
+                text = f"Keep {mark} unchanged; quote {tag}."
+                prompt = _service_prompt(self.service, [{"role": "user", "content": text}])
+                self.assertIn(f"Keep {mark} unchanged; quote {tag}.", prompt)   # exact original text
+                self.assertEqual(prompt.count(mark), 1)                         # survives as itself, once
+
+    def test_assistant_and_tool_roles_survive_too(self):
+        from serve.frontend import LITERAL_TAGS, TOOL_LITERAL_TAGS
+        for role in ("assistant", "tool", "user"):
+            for tag, mark in LITERAL_TAGS.items():
+                if role == "assistant" and tag in TOOL_LITERAL_TAGS:
+                    continue          # by design (#2026): the assistant's raw tool-call text stays its own tokens
+                with self.subTest(role=role, tag=tag):
+                    text = f"Keep {mark} unchanged; quote {tag}."
+                    msgs = [{"role": "user", "content": "earlier"}, {"role": role, "content": text}]
+                    prompt = _service_prompt(self.service, msgs)
+                    self.assertIn(text, prompt)
+                    self.assertEqual(prompt.count(mark), 1)
+
+    def test_all_marks_survive_together_with_tools_and_parts(self):
+        from serve.frontend import LITERAL_TAGS
+        marks = "".join(LITERAL_TAGS.values())
+        tags = " ".join(LITERAL_TAGS)
+        msgs = [{"role": "user", "content": [{"type": "text", "text": f"own:{marks}|"},
+                                             {"type": "text", "text": f"quoted:{tags}"}]},
+                {"role": "tool", "content": f"tool says {marks} and {tags}"}]
+        tools = [{"type": "function", "function": {"name": "f", "description": f"d {marks} {tags}",
+                                                   "parameters": {"type": "object", "properties": {
+                                                       "p": {"type": "string", "description": f"{marks}{tags}"}}}}}]
+        prompt = _service_prompt(self.service, msgs, tools)
+        for mark in LITERAL_TAGS.values():
+            self.assertGreaterEqual(prompt.count(mark), 2)      # user turn + tool turn keep their own
+        self.assertIn(f"own:{marks}|quoted:{tags}", prompt)
+
+    def test_control_mark_collision_quoted_control(self):
+        from serve.frontend import literal_tags
+        tags = literal_tags(self.tok.control_tokens)
+        for control in self.tok.control_tokens:
+            mark = tags[control]
+            with self.subTest(control=control):
+                text = f"paste {mark} and the text {control}."
+                prompt = _service_prompt(self.service, [{"role": "user", "content": text}])
+                self.assertIn(f"paste {mark} and the text {control}.", prompt)
+
+    def test_effective_tags_none_without_collision_and_ids_cold_warm_equal(self):
+        from serve.frontend import mark_think_literals
+        tags = literal_tags = __import__("serve.frontend", fromlist=["literal_tags"]).literal_tags(
+            self.tok.control_tokens)
+        m, t, changed, lit = mark_think_literals([{"role": "user", "content": "quote </think>."}], None, tags)
+        self.assertTrue(changed)
+        self.assertIsNone(lit)                                    # no own PUA char: today's marks, no relocation
+        msgs = [{"role": "user", "content": "keep \U000F0E01; quote " + THINK_CLOSE + "."}]
+        tools = [{"type": "function", "function": {"name": "f", "description": "\U000F0E07 text"}}]
+        ids1 = self.service.encode_prompt(msgs, tools, {})
+        ids2 = self.service.encode_prompt(msgs, tools, {})
+        self.assertEqual(ids1, ids2)                              # cold == warm
+        self.assertEqual(_service_prompt(self.service, msgs, tools).count("\U000F0E01"), 1)
+
+    def test_no_tag_request_returns_same_objects(self):
+        from serve.frontend import mark_think_literals
+        msgs = [{"role": "user", "content": "plain"}]
+        m, t, changed, lit = mark_think_literals(msgs, None, self.tok and __import__(
+            "serve.frontend", fromlist=["LITERAL_TAGS"]).LITERAL_TAGS)
+        self.assertFalse(changed)
+        self.assertIsNone(lit)
+        self.assertIs(m, msgs)
+
+
+class UnmarkSparseEquivalence(unittest.TestCase):
+    """Audit 2026-10-20 (A): sparse str.find scanning replaced the alternation regex in unmark_think_literals.
+    Every case must produce exactly the reference regex' text and spans, and a mark-free prompt comes back
+    as the same object (no rebuild)."""
+
+    @staticmethod
+    def _reference(prompt, tags):
+        marks = {v: k for k, v in tags.items()}
+        mark_re = __import__("re").compile("|".join(map(__import__("re").escape, marks)))
+        out, spans, pos, n = [], [], 0, 0
+        for m in mark_re.finditer(prompt):
+            out.append(prompt[pos:m.start()])
+            n += m.start() - pos
+            tag = marks[m.group(0)]
+            out.append(tag)
+            spans.append((n, n + len(tag)))
+            n += len(tag)
+            pos = m.end()
+        out.append(prompt[pos:])
+        return "".join(out), spans
+
+    def test_random_cases_match_reference(self):
+        import random
+        from serve.frontend import LITERAL_TAGS, unmark_think_literals
+        rng = random.Random(20261020)
+        pieces = ["abc", "你好", "e\u0301", "\U0001F469", "\U000F0EFF"] + list(LITERAL_TAGS.values())
+        for _ in range(200):
+            text = "".join(rng.choice(pieces) for _ in range(rng.randrange(100)))
+            self.assertEqual(unmark_think_literals(text), self._reference(text, LITERAL_TAGS))
+
+    def test_mark_free_prompt_returns_same_object(self):
+        from serve.frontend import unmark_think_literals
+        text = "a prompt without a single mark " * 400
+        out, spans = unmark_think_literals(text)
+        self.assertIs(out, text)
+        self.assertEqual(spans, [])
+
+    def test_multi_char_mark_keeps_the_regex_path(self):
+        from serve.frontend import unmark_think_literals
+        out, spans = unmark_think_literals("a<<>>b", {"<x>": "<<>>"})
+        self.assertEqual((out, spans), ("a<x>b", [(1, 4)]))
+
+
+class PinBillingStamp(unittest.TestCase):
+    """Audit 2026-10-20 (B): stamp pinning only ever reads and changes the header's first 256 chars; the bounded
+    version must decide exactly like the old full-string one (differential below) and must not copy the whole
+    system text when nothing changes."""
+
+    @staticmethod
+    def _old(system):
+        """The pre-fix implementation (f50eb8f6), verbatim."""
+        from serve.frontend import BILLING_HEADER
+        if not system.startswith(BILLING_HEADER):
+            return system
+        s = list(system)
+        cch = system.find("cch=", len(BILLING_HEADER))
+        if 0 <= cch <= 160:
+            v, end = cch + 4, system.find(";", cch + 4)
+            if end > v and end - v <= 16:
+                s[v:end] = "f" * (end - v)
+        cv = system.find("cc_version=")
+        if 0 <= cv <= 160:
+            v, end = cv + len("cc_version="), system.find(";", cv)
+            if v < end and end - v <= 64:
+                parts = system[v:end].split(".")
+                if len(parts) > 3:
+                    tail = v + len(".".join(parts[:3])) + 1
+                    s[tail:end] = "f" * (end - tail)
+        return "".join(s)
+
+    def test_real_claude_code_header_pinned(self):
+        from serve.frontend import pin_billing_stamp
+        sys_txt = ("x-anthropic-billing-header: cc_version=2.1.170.bf4; cc_entrypoint=sdk-cli; cch=b145e;\n"
+                   "You are Claude Code.")
+        self.assertEqual(pin_billing_stamp(sys_txt),
+                         "x-anthropic-billing-header: cc_version=2.1.170.fff; cc_entrypoint=sdk-cli; cch=fffff;\n"
+                         "You are Claude Code.")
+
+    def test_differential_random_boundary_cases(self):
+        import random
+        from serve.frontend import BILLING_HEADER, pin_billing_stamp
+        rng = random.Random(20)
+        for _ in range(1000):
+            text = BILLING_HEADER + "x" * rng.randrange(180)
+            text += rng.choice(["cc_version=1.2.3;", "cch=abcd;", "cc_version=" + "x" * 80 + ";", "nothing"])
+            text += rng.choice([";cch=1234;", ";cc_version=2.3.4.5;", ""]) + "z" * rng.randrange(400)
+            self.assertEqual(pin_billing_stamp(text), self._old(text))
+
+    def test_far_beyond_the_limit_cannot_change_anything(self):
+        from serve.frontend import BILLING_HEADER, pin_billing_stamp
+        late = BILLING_HEADER + "x" * 300 + "; cch=abcd; cc_version=9.9.9.9;"
+        self.assertIs(pin_billing_stamp(late), late)            # ';' and fields only past char 256
+        self.assertEqual(self._old(late), late)                 # the old code agreed (conditions never held)
+
+    def test_unchanged_long_text_returns_same_object(self):
+        from serve.frontend import BILLING_HEADER, pin_billing_stamp
+        text = BILLING_HEADER + "no version, no cch" + "y" * 100000
+        self.assertIs(pin_billing_stamp(text), text)
+
+    def test_changed_long_text_only_rewrites_the_head(self):
+        from serve.frontend import BILLING_HEADER, pin_billing_stamp
+        text = BILLING_HEADER + "cc_version=1.2.3.abcd; cch=zzz;\n" + "body " * 30000
+        out = pin_billing_stamp(text)
+        self.assertEqual(out[:256], self._old(text)[:256])
+        self.assertEqual(out[256:], text[256:])                 # the body is passed through untouched
+
+    def test_unicode_tail_untouched_long_and_short(self):
+        from serve.frontend import BILLING_HEADER, pin_billing_stamp
+        text = BILLING_HEADER + "cc_version=1.2.3.abcd; cch=zzz;\n" + "\u4f60\u597d \U0001F469 \u00e9 " * 5000
+        out = pin_billing_stamp(text)
+        self.assertEqual(out[256:], text[256:])
+        short = BILLING_HEADER + "nothing here é👩"
+        self.assertIs(pin_billing_stamp(short), short)
+
+
+class ReviewCorrections20261021(unittest.TestCase):
+    """Codex review 2026-10-21: schema KEYS carry PUA characters into the prompt too (R1), the observer must not
+    materialize an occurrence list (R2), the candidate pool must not refuse while BMP private-use is free (R4),
+    and marker-dense prompts fall back to the regex with bounded allocation. Full encode_prompt paths, MockEngine."""
+
+    def setUp(self):
+        self.template = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
+        self.tok = ByteTokenizer()
+        self.service = Service(MockEngine(self.tok, "ok"), self.tok, self.template)
+
+    def test_schema_key_pua_survives_full_path(self):
+        from serve.frontend import LITERAL_TAGS
+        tag, mark = next(iter(LITERAL_TAGS.items()))
+        tools = [{"name": "f", "description": "schema key test",
+                  "parameters": {"type": "object", "properties": {mark: {"type": "string"}}}}]
+        msgs = [{"role": "user", "content": "Quote " + tag + " as text."}]
+        prompt = self.tok.decode(self.service.encode_prompt(msgs, tools, {"enable_thinking": False}))
+        self.assertIn(mark, prompt)                       # the key's character survives as itself
+        self.assertNotIn('"' + tag + '"', prompt)         # never rewritten into the tag text
+
+    def test_allocation_candidate_appearing_in_a_key_survives(self):
+        from serve.frontend import LITERAL_TAGS, mark_think_literals
+        tag, mark = next(iter(LITERAL_TAGS.items()))
+        cand = chr(0xE000)                                # the first candidate the allocator tries
+        msgs = [{"role": "user", "content": "Keep " + mark + " and quote " + tag + "."}]
+        tools = [{"name": "f", "parameters": {"properties": {cand: {"type": "string"}}}}]
+        lit = mark_think_literals(msgs, tools, self.service.literals)[3]
+        self.assertIsNotNone(lit)                         # cand is observed (key): relocation happened
+        self.assertNotIn(cand, lit.values())              # and the candidate itself was never handed out
+        prompt = self.tok.decode(self.service.encode_prompt(msgs, tools, {"enable_thinking": False}))
+        self.assertIn(cand, prompt)                       # key character intact...
+        self.assertIn(mark, prompt)                       # ...and the message's character intact too
+
+    def test_pua_observer_repeats_cost_distinct_not_occurrences(self):
+        import tracemalloc
+        from serve.frontend import LITERAL_TAGS, _observed_pua
+        text = next(iter(LITERAL_TAGS.values())) * 100000
+        tracemalloc.start()
+        found = set()
+        _observed_pua(text, found)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        self.assertEqual(found, {next(iter(LITERAL_TAGS.values()))})
+        self.assertLess(peak, 1_000_000)                  # the findall version peaked at ~7.2 MB here
+
+    def test_allocator_uses_every_pool_and_refuses_only_when_all_are_full(self):
+        from serve.frontend import _collision_free_tags
+        lit = self.service.literals
+        reserved = set(lit.values())
+        observed = set(map(chr, range(max(map(ord, reserved)) + 1, 0x100000))) | {next(iter(reserved))}
+        out = _collision_free_tags(lit, observed)         # 61,953 observed: the old suffix allocator refused here
+        moved = set(out.values()) - reserved
+        self.assertTrue(moved and all(0xE000 <= ord(m) <= 0xF8FF for m in moved))   # served from the BMP pool
+        self.assertFalse(moved & observed)
+        full = set(map(chr, range(0xE000, 0xF900))) | set(map(chr, range(0xF0000, 0x110000)))
+        with self.assertRaises(ValueError):               # refusal only at genuinely all ~137K candidates taken
+            _collision_free_tags(lit, full | {next(iter(reserved))})
+
+    def test_dense_marks_fall_back_to_the_regex_path(self):
+        from serve.frontend import LITERAL_TAGS, unmark_think_literals
+        mark = next(iter(LITERAL_TAGS.values()))
+        ref = UnmarkSparseEquivalence._reference
+        for reps, label in ((4096, "at the cap - sparse path"), (4097, "just past it - regex fallback")):
+            text = ("abc" + mark) * reps
+            with self.subTest(label):
+                self.assertEqual(unmark_think_literals(text), ref(text, LITERAL_TAGS))

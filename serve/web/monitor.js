@@ -1,17 +1,22 @@
 "use strict";
 const $ = id => document.getElementById(id);
-let selected = null, detail = null, pane = "input", records = [], state = null, operating = false, stamp = "", actionError = "";
-let apiKey = sessionStorage.getItem("strata.monitor.key") || "";
-document.documentElement.dataset.theme = localStorage.getItem("strata.theme") || "dark";
+let selected = null, detail = null, pane = "input", records = [], state = null, operating = false, stamp = "", actionError = "", detailError = "";
+// a blocked browser storage (private mode, cookies off) must not kill the page before it renders:
+// the key just lives in this tab and the theme falls back to the dark default
+let apiKey = "";
+try { apiKey = sessionStorage.getItem("strata.monitor.key") || ""; } catch (_) { apiKey = ""; }
+try { document.documentElement.dataset.theme = localStorage.getItem("strata.theme") || "dark"; }
+catch (_) { document.documentElement.dataset.theme = "dark"; }
 const seconds = n => typeof n === "number" ? `${n.toFixed(2)} s` : "—";
 const speed = n => typeof n === "number" ? n.toFixed(1) : "—";
 const active = r => !["completed", "error", "disconnected"].includes(r.state);
 function text(id, value) { const el = $(id); if (el.textContent !== String(value)) el.textContent = value; }
-async function api(path, body) {
+async function api(path, body, current = null) {
   const response = await fetch(path, {cache:"no-store", headers:{...(apiKey ? {Authorization:`Bearer ${apiKey}`} : {}), ...(body !== undefined ? {"Content-Type":"application/json"} : {})}, ...(body !== undefined ? {method:"POST", body:JSON.stringify(body)} : {})});
   const value = await response.json();
   if (!response.ok) {
-    if (response.status === 401) $("auth").hidden = false;
+    // the key form belongs to the request the page still cares about: an obsolete 401 must not open it
+    if (response.status === 401 && (!current || current())) $("auth").hidden = false;
     throw new Error(value.error?.message || `HTTP ${response.status}`);
   }
   return value;
@@ -54,11 +59,21 @@ function content() {
   const note = pane === "output" && detail.error ? "Raw model output retained for diagnosis. The API returned an error." : pane === "input" ? "Original request body." : pane === "output" ? "Model answer. JSON is formatted here for readability." : pane === "reasoning" ? "Separate reasoning content, when enabled." : "API response body.";
   text("content-note", note + (detail[`${pane}_truncated`] ? " Monitor capture truncated at 256K characters; the API response was not shortened." : ""));
 }
+let detailSeq = 0;                                 // A -> B -> A: only the newest answer for the current selection
 async function showDetail() {
   if (!selected) return;
-  const id = selected;
-  const value = await api(`/api/requests?id=${encodeURIComponent(id)}`);
-  if (selected !== id) return;
+  const id = selected, seq = ++detailSeq;
+  const current = () => selected === id && seq === detailSeq;
+  let value;
+  try { value = await api(`/api/requests?id=${encodeURIComponent(id)}`, undefined, current); }
+  catch (error) {
+    if (!current()) return;                                        // a stale detail failure stays silent
+    detailError = error.message || "the request could not be read";
+    notice(detailError);
+    return;
+  }
+  if (!current()) return;
+  detailError = "";                                                // a readable request clears its old failure
   detail = value; $("selection").hidden = false; $("no-selection").hidden = true;
   text("detail-title", `${value.id} · ${value.path}`);
   text("detail-status", value.state); $("detail-status").className = `tag ${value.state}`;
@@ -70,13 +85,17 @@ async function showDetail() {
   text("detail-speed", speed(value.timings?.predicted_per_second)); text("detail-format", value.response_format || "text");
   $("detail-error").hidden = !value.error; text("detail-error", value.error?.message || ""); content();
 }
+let refreshSeq = 0;                                 // poll, auth and load/unload all refresh: the newest wins
 async function refresh() {
+  const seq = ++refreshSeq;
+  const current = () => seq === refreshSeq;
   try {
-    const [status, history] = await Promise.all([api("/v1/status"), api("/api/requests")]);
+    const [status, history] = await Promise.all([api("/v1/status", undefined, current), api("/api/requests", undefined, current)]);
+    if (!current()) return;
     state = status; records = history.requests;
     status.loaded = history.loaded; status.auto_load = history.auto_load;
     if (selected && !records.some(r => r.id === selected)) {
-      selected = detail = null; $("selection").hidden = true; $("no-selection").hidden = false;
+      selected = detail = null; detailError = ""; $("selection").hidden = true; $("no-selection").hidden = false;
     }
     const inflight = Math.max(status.activity.in_flight, records.filter(active).length);
     const loading = records.some(r => r.state === "loading");
@@ -88,9 +107,13 @@ async function refresh() {
     text("wall", last ? seconds(last.wallclock_s) : "—"); text("speed", speed(last?.timings?.predicted_per_second));
     $("load").disabled = operating || Boolean(inflight) || status.loaded; $("unload").disabled = operating || Boolean(inflight) || !status.loaded;
     list(); if (selected) await showDetail();
+    if (!current()) return;                        // that await may have hidden a newer failure
     text("updated", `Live · updated ${new Date().toLocaleTimeString()}`);
-    if (!operating) notice(actionError);
-  } catch (error) { notice(error.message); text("updated", "Disconnected · retrying"); $("load").disabled = $("unload").disabled = true; }
+    if (!operating) notice(actionError || detailError);           // a detail failure this refresh must survive it
+  } catch (error) {
+    if (!current()) return;
+    notice(error.message); text("updated", "Disconnected · retrying"); $("load").disabled = $("unload").disabled = true;
+  }
 }
 async function control(load) {
   actionError = "";
@@ -102,8 +125,20 @@ async function control(load) {
 }
 $("load").onclick = () => control(true); $("unload").onclick = () => control(false);
 $("key").onclick = () => { $("auth").hidden = !$("auth").hidden; if (!$("auth").hidden) $("api-key").focus(); };
-$("auth").onsubmit = async event => { event.preventDefault(); apiKey = $("api-key").value.trim(); sessionStorage.setItem("strata.monitor.key", apiKey); $("auth").hidden = true; await refresh(); };
-$("theme").onclick = () => { const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = theme; localStorage.setItem("strata.theme", theme); };
+$("auth").onsubmit = async event => {
+  event.preventDefault();
+  apiKey = $("api-key").value.trim();
+  actionError = "";
+  try { sessionStorage.setItem("strata.monitor.key", apiKey); }
+  catch (_) { actionError = "The key works in this tab only: this browser did not store it."; }
+  $("auth").hidden = true;
+  await refresh();
+};
+$("theme").onclick = () => {
+  const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem("strata.theme", theme); } catch (_) { /* the switch still works for this page */ }
+};
 $("search").oninput = list; $("filter").onchange = list;
 document.querySelectorAll("[data-pane]").forEach(button => { button.onclick = () => { pane = button.dataset.pane; document.querySelectorAll("[data-pane]").forEach(b => b.setAttribute("aria-selected", String(b === button))); content(); }; });
 $("copy").onclick = async () => { try { await navigator.clipboard.writeText($("content").textContent); text("copy", "Copied"); setTimeout(() => text("copy", "Copy"), 1500); } catch (_) { notice("Clipboard unavailable; select the text to copy it."); } };

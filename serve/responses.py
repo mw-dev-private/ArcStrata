@@ -27,7 +27,7 @@ import json
 import time
 import uuid
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
+from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, history_call_problem, order_tool_results
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -184,6 +184,9 @@ def input_messages(req: dict) -> list[dict]:
                 args = _arguments(item.get("arguments"), param + ".arguments")
             else:
                 args = {"input": item.get("input") if isinstance(item.get("input"), str) else ""}
+            problem = history_call_problem(name, args)
+            if problem:
+                raise ResponsesError(f"a {kind}'s {problem[0]} {problem[1]}", f"{param}.{problem[0]}")
             target = open_turn if open_turn is not None and not thinking else turn()
             target.setdefault("tool_calls", []).append({"function": {"name": name, "arguments": args},
                                                         "_call_id": item.get("call_id")})
@@ -213,24 +216,8 @@ def input_messages(req: dict) -> list[dict]:
 def _order_tool_results(messages):
     """The template places tool results by position: each run of tool messages is put in the order of the calls of
     the assistant turn before it (a client may send the results in the order they finished), then the private call
-    ids are dropped."""
-    i = 0
-    while i < len(messages):
-        if messages[i]["role"] != "tool":
-            i += 1
-            continue
-        j = i
-        while j < len(messages) and messages[j]["role"] == "tool":
-            j += 1
-        prev = messages[i - 1] if i else {}
-        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
-        rank = {cid: k for k, cid in enumerate(order) if cid}
-        messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
-        i = j
-    for m in messages:
-        m.pop("_call_id", None)
-        for c in m.get("tool_calls") or []:
-            c.pop("_call_id", None)
+    ids are dropped.  (The one implementation is frontend.order_tool_results; chat and messages use its exact form.)"""
+    order_tool_results(messages)
 
 
 def request_tools(req: dict):
@@ -681,10 +668,11 @@ class Assembler:
         return self.event("response.failed", response=self.snapshot())
 
 
-def collect(events) -> dict:
-    """The non-streaming answer: the final response object."""
+def collect(events) -> dict | None:
+    """The non-streaming answer: the final response object.  None when the run ended without one: the client hung up
+    and the turn was cancelled before the response was completed (its last event is then a delta, not a response)."""
     last = None
     for e in events:
         if e is not None:
             last = e
-    return last["response"]
+    return None if last is None else last.get("response")

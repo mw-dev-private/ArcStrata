@@ -733,8 +733,8 @@ class LiteralControlTokens(unittest.TestCase):
             with self.subTest(order=order):
                 tok = ST.Tokenizer([b2u[b] for b in range(256)] + order, [], [1] * 256 + [3, 3])
                 tags = literal_tags(tok.control_tokens)
-                marked, _, _ = mark_think_literals([{"role": "user", "content": text}], None, tags)
-                prompt, plain = unmark_think_literals(marked[0]["content"], tags)
+                marked, _, _, lit = mark_think_literals([{"role": "user", "content": text}], None, tags)
+                prompt, plain = unmark_think_literals(marked[0]["content"], lit or tags)
                 self.assertEqual(tok.encode(prompt, parse_special=True, plain=plain), [*text.encode()])
 
     def test_the_real_tokenizer_names_its_control_tokens(self):

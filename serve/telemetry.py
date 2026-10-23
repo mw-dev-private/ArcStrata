@@ -554,12 +554,23 @@ class Telemetry:
         if prev is None or t <= prev[0]:
             return None, None
         dt = t - prev[0]
-        return (c.read_bytes - prev[1]) / dt / 2**20, (c.write_bytes - prev[2]) / dt / 2**20
+        # a counter that went backwards (reset, wrap) is no reading for this interval, not a negative rate
+        return ((c.read_bytes - prev[1]) / dt / 2**20 if c.read_bytes >= prev[1] else None,
+                (c.write_bytes - prev[2]) / dt / 2**20 if c.write_bytes >= prev[2] else None)
+
+    @staticmethod
+    def _read_card(g):
+        """One card's reading; a reader that raises is "no reading" (the same as a card whose calls all returned None)."""
+        try:
+            r = g.read()
+        except Exception:  # noqa: BLE001 - telemetry must never take the server down
+            return {}
+        return r if isinstance(r, dict) else {}
 
     def sample(self):
         s = {}
         if self.gpu.ok():
-            reads = [(i, g.read()) for i, g in self.gpus]
+            reads = [(i, self._read_card(g)) for i, g in self.gpus]
             g = dict(reads[0][1])
             if len(reads) > 1:
                 def vals(k):
@@ -599,7 +610,10 @@ class Telemetry:
 
     def _loop(self):
         while not self._stop.is_set():
-            s = self.sample()
+            try:
+                s = self.sample()
+            except Exception:  # noqa: BLE001 - one lost sample must not end the sampler thread (the Monitor and gpu_busy would keep the last one)
+                s = {}
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",

@@ -54,8 +54,17 @@ class _Slot:
 
     def __init__(self):
         self.done = threading.Event()
+        self.abandoned = threading.Event()               # the caller gave up (deadline, stop button): a worker may end
+        self.gate = threading.Lock()                     # makes "sent or abandoned first" one decision (see StdioTransport._send)
+        self.sent = False                                # the request's write has begun: the server may have it
         self.msg = None
         self.error = None
+
+
+def _id_ok(x) -> bool:
+    """A response's id as the request had it: an integer (or a string).  A JSON boolean is not an id although
+    `True == 1` in Python, and a list or object cannot even be looked up."""
+    return isinstance(x, (int, float, str)) and not isinstance(x, bool)
 
 
 def _wait(slot: _Slot, timeout: float, cancel: threading.Event | None, what: str):
@@ -72,7 +81,12 @@ def _wait(slot: _Slot, timeout: float, cancel: threading.Event | None, what: str
     if "error" in msg:
         err = msg["error"] if isinstance(msg["error"], dict) else {"message": str(msg["error"])}
         raise McpError(f"{err.get('message') or 'error'} (code {err.get('code')})")
-    return msg.get("result") or {}
+    if "result" not in msg:
+        raise McpError("the server's response has neither a result nor an error")
+    result = msg["result"]
+    if result is not None and not isinstance(result, dict):
+        raise McpError(f"the server's result is not an object but {type(result).__name__}")
+    return result or {}
 
 
 # ------------------------------------------------------------------------------------------------ transports
@@ -171,22 +185,37 @@ class StdioTransport:
                 except McpError:
                     pass
             return                                       # notifications (log messages, list changes): not used
+        rid = m.get("id")
+        if not _id_ok(rid):                              # null (an error for a line it could not parse), true, a list ...
+            return
         with self.lock:
-            slot = self.pending.pop(m.get("id"), None)
+            slot = self.pending.pop(rid, None)
         if slot is not None:                             # an answer to a call that timed out is simply dropped
             slot.msg = m
             slot.done.set()
 
-    def _send(self, msg: dict):
+    def _send(self, msg: dict, slot: _Slot | None = None) -> bool:
+        """Write one message.  With a `slot` (a request): not at all if its caller gave up while it waited for the
+        writer - a call that already returned as timed out or stopped must not reach the server and run a tool
+        afterwards.  The decision is taken under the write lock, right before the write; a write that has begun
+        is not taken back.  -> whether it was written."""
         data = json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n"
         try:
             with self.write_lock:
+                if slot is not None:
+                    with slot.gate:
+                        if slot.abandoned.is_set():
+                            return False
+                        slot.sent = True
                 self.proc.stdin.write(data)
                 self.proc.stdin.flush()
+                return True
         except (OSError, ValueError):
             raise McpError(f"the server stopped{self._tail()}") from None
 
     def request(self, method: str, params: dict, timeout: float, cancel=None):
+        if cancel is not None and cancel.is_set():       # stopped before the call: nothing is sent (a tool may have effects)
+            raise McpCancelled("stopped")
         if not self.alive():
             raise McpError(f"the server is not running{self._tail()}")
         slot = _Slot()
@@ -194,17 +223,37 @@ class StdioTransport:
             self.next_id += 1
             rid = self.next_id
             self.pending[rid] = slot
+        # The write runs on its own thread: a server that does not read its stdin (hung, busy) lets a large message
+        # fill the pipe, and a write that waits for room would ignore the deadline and the stop button.
+        threading.Thread(target=self._write_request, args=({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, rid, slot),
+                         daemon=True).start()
         try:
-            self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
             return _wait(slot, timeout, cancel, method)
         except (McpTimeout, McpCancelled) as e:
             with self.lock:
                 self.pending.pop(rid, None)
-            try:                                         # tell the server to stop working on it
-                self.notify("notifications/cancelled", {"requestId": rid, "reason": str(e)})
-            except McpError:
-                pass
+            with slot.gate:
+                slot.abandoned.set()                     # a write still waiting for the writer is dropped
+                sent = slot.sent
+            if sent:                                     # tell the server to stop working on it - on a thread too, the pipe may still be full
+                threading.Thread(target=self._quiet_notify, args=("notifications/cancelled", {"requestId": rid, "reason": str(e)}),
+                                 daemon=True).start()
             raise
+
+    def _write_request(self, msg: dict, rid, slot: _Slot):
+        try:
+            self._send(msg, slot)
+        except McpError as e:                            # the server is gone: the waiting call ends now
+            with self.lock:
+                self.pending.pop(rid, None)
+            slot.error = e
+            slot.done.set()
+
+    def _quiet_notify(self, method, params):
+        try:
+            self.notify(method, params)
+        except McpError:
+            pass
 
     def notify(self, method: str, params: dict | None = None):
         self._send({"jsonrpc": "2.0", "method": method, **({"params": params} if params is not None else {})})
@@ -214,13 +263,20 @@ class StdioTransport:
         p = self.proc
         if p is None:
             return
-        try:
-            p.stdin.close()
-        except OSError:
-            pass
-        try:
-            p.wait(timeout=2)
-        except subprocess.TimeoutExpired:
+        # A write that is stuck on a full pipe (the server does not read) holds the stdin lock, and closing stdin
+        # would wait for it as long as the server lives: end the server instead, which also frees that write.
+        if self.write_lock.acquire(timeout=0.5):
+            try:
+                p.stdin.close()
+            except OSError:
+                pass
+            finally:
+                self.write_lock.release()
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._kill_tree(p)
+        else:
             self._kill_tree(p)
         for f in (p.stdout, p.stderr):
             try:
@@ -288,13 +344,13 @@ class HttpTransport:
                     return
                 ctype = r.headers.get("Content-Type", "")
                 if "text/event-stream" in ctype:
-                    found = self._from_events(r, rid)
+                    found = self._from_events(r, rid, slot)
                 else:
                     body = r.read()
                     found = None
                     parsed = json.loads(body) if body.strip() else None
                     for m in parsed if isinstance(parsed, list) else [parsed]:
-                        if isinstance(m, dict) and m.get("id") == rid and "method" not in m:
+                        if isinstance(m, dict) and _id_ok(m.get("id")) and m.get("id") == rid and "method" not in m:
                             found = m
                 if found is None:
                     raise McpError("the server's answer did not contain a response")
@@ -321,10 +377,14 @@ class HttpTransport:
                 slot.done.set()
 
     @staticmethod
-    def _from_events(r, rid):
-        """Read the event stream until the event that answers `rid` (it may carry notifications first)."""
+    def _from_events(r, rid, slot=None):
+        """Read the event stream until the event that answers `rid` (it may carry notifications first), or until the
+        caller gave up (`slot.abandoned`): a server that keeps the stream open with comments or progress would
+        otherwise keep this thread and its connection for as long as it likes."""
         data = []
         for raw in r:
+            if slot is not None and slot.abandoned.is_set():
+                return None
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
             if line.startswith("data:"):
                 data.append(line[5:].lstrip(" "))
@@ -335,11 +395,13 @@ class HttpTransport:
                     m = None
                 data = []
                 for x in m if isinstance(m, list) else [m]:
-                    if isinstance(x, dict) and x.get("id") == rid and "method" not in x:
+                    if isinstance(x, dict) and _id_ok(x.get("id")) and x.get("id") == rid and "method" not in x:
                         return x
         return None
 
     def request(self, method: str, params: dict, timeout: float, cancel=None):
+        if cancel is not None and cancel.is_set():       # stopped before the call: nothing is sent (a tool may have effects)
+            raise McpCancelled("stopped")
         if self.broken:
             raise self.broken
         with self.lock:
@@ -352,6 +414,7 @@ class HttpTransport:
         try:
             return _wait(slot, timeout, cancel, method)
         except (McpTimeout, McpCancelled) as e:
+            slot.abandoned.set()
             threading.Thread(target=self._quiet_notify, args=("notifications/cancelled",
                                                               {"requestId": rid, "reason": str(e)}), daemon=True).start()
             raise
@@ -419,6 +482,8 @@ class McpServer:
                     if "code -32601" in str(e) and not tools:   # a server without tools (prompts/resources only)
                         break
                     raise
+                if not isinstance(page.get("tools") or [], list):
+                    raise McpError("tools/list: \"tools\" is not a list")
                 tools += [x for x in page.get("tools") or [] if isinstance(x, dict) and x.get("name")]
                 cursor = page.get("nextCursor")
                 if not cursor:
@@ -436,6 +501,8 @@ class McpServer:
             return False
 
     def call(self, tool: str, arguments: dict, timeout: float, cancel=None) -> dict:
+        if cancel is not None and cancel.is_set():       # not even a restart for a call that was stopped
+            raise McpCancelled("stopped")
         with self.lock:
             if self.transport is None or not self.transport.alive():
                 # it stopped since its last call (a crash, an expired session): start it again; one that failed to

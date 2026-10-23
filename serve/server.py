@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import collections
+import copy
 import base64
 import hashlib
 import hmac
@@ -314,6 +315,11 @@ class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
 
+class EmbeddingFileError(RuntimeError):
+    """A local file error while the images' combined embeddings file was made or written (a full /dev/shm or disk, a cached
+    embeddings file that is gone): the server's fault and before any answer - a 500, not a client that left (A04a)."""
+
+
 class EngineStarting(RuntimeError):
     """The engine is (re)starting and has not said READY yet (#344): no context size to plan a request with - a 503,
     not a 400 about the prompt."""
@@ -341,6 +347,15 @@ class EngineNonFinite(ValueError):
     ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
 
 
+class StreamCorrupted(ValueError):
+    """A03f: the engine's own slot stream broke its wire grammar mid-request - a BT token line the native
+    emitter can never print (see _bt_field).  Never the client's fault: a bare ValueError/IndexError out of
+    the parse lands in the 400 handlers and blames the request body for an engine-side wire fault.  Never a
+    token either: the request ends as a 503 and the slot's A03b cleanup (arm, BSTOP once, watcher) is
+    untouched - EOF / a valid BDONE / the quarantine decide.  A ValueError like EngineNonFinite, so a stream
+    that has already started reports it as an error event instead of dropping the connection."""
+
+
 class SessionRefused(ValueError):
     """Disk sessions: the engine refused or failed a SAVE / RESTORE and is still in step (`SERR <kind> <published>
     <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
@@ -356,6 +371,15 @@ class SessionRefused(ValueError):
     @property
     def status(self) -> int:
         return self.STATUS[self.kind]
+
+
+class _Start:
+    """One process generation: the handles a close may touch, and nothing of a successor's."""
+    __slots__ = ("gen", "proc", "pump", "log", "stuck")
+
+    def __init__(self, proc, log):
+        self.gen, self.proc, self.pump, self.log = None, proc, None, log
+        self.stuck = False                       # EngineStuck: the process lives on, the owner keeps it
 
 
 class EngineStuck(RuntimeError):
@@ -669,6 +693,7 @@ class ConvCacheLog:
 
     def __init__(self):
         self.key, self.pos = None, 0
+        self.lock = threading.Lock()                    # metrics() runs on one handler thread per request: one poll reads and advances at a time
         self.reset()
 
     def reset(self):
@@ -677,6 +702,10 @@ class ConvCacheLog:
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
+        with self.lock:
+            return self._poll(path, start)
+
+    def _poll(self, path, start) -> dict:
         if not path or start is None:
             return dict(self.state)
         if self.key != (path, start):                   # another start of the engine: its cache starts empty
@@ -750,6 +779,14 @@ def btrace(*a):
 
 
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
+# A03d: the result states of the #1869 read-back (_bdone_after_eos) - INTERNAL only, never a wire or
+# public format.  A plain None could not tell "no end signal within wait_s" apart from "I just consumed
+# this queue's EOF", and the cleanup armed afterwards then waited 600 s for a signal that was already
+# eaten.  A tuple (kind, payload) with these kinds keeps the four states unambiguous.
+_END_BDONE, _END_EOF, _END_NONE, _END_GONE = "bdone", "eof", "none", "gone"
+# A03e: the finish vocabulary of the ONLY native emitters (generate.cpp 10987/11004 and 11164/11182,
+# both window variants): printf("BDONE %d %lld %s %.1f\n", slot, produced, stop|cancel|length|nonfinite, ms).
+_BDONE_FINISH = ("stop", "length", "cancel", "nonfinite")
 
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
@@ -792,6 +829,12 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
+        if "_own" not in self.__dict__:      # ownership outlives the process: restart() calls __init__ again
+            self._own = threading.Lock()     # short lock: publish/snapshot only, never over wait/join
+            self._intent = 0                 # user intent generation: unload()/close() bump it
+            self._published = None           # the CURRENT _Start (or None): the only owner a close may touch
+            self._inflight_close = None      # a start context whose close is running (or failed with EngineStuck)
+            self._start_tl = threading.local()   # this thread's last start context (restart() uses it)
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
@@ -841,6 +884,9 @@ class StrataEngine:
         spawned_at = time.monotonic()
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
+        start = _Start(self.proc, self.log)
+        with self._own:                     # provisional owner: an unload during READY can end this start
+            self._published = start
         contain(self.proc)                               # ends with the server, however it ends (Windows)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
@@ -932,28 +978,6 @@ class StrataEngine:
         groups = int(self.info.get("batch_groups") or 1) if _bg in ("auto", "default") else int(_bg)
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
-        # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
-        self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
-        self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
-        self.slot_groups = groups
-        # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
-        # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
-        # conversation cache - see pick_slot
-        groups_run = int(self.info.get("batch_groups") or groups)
-        self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
-        self.slot_q = [queue.Queue() for _ in range(self.batch)]
-        self.slot_busy = [False] * self.batch
-        # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
-        # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
-        # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
-        self.slot_claims: set[int] = set()
-        self.slot_releasing: set[int] = set()
-        self._orphan_seen: dict[int, float] = {}
-        # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
-        # the slot that has its start (the engine checks it again); when the slot was last used
-        self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
-        self.slot_used = [0.0] * self.batch
-        self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
         # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
@@ -965,15 +989,54 @@ class StrataEngine:
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
-        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
-        self._ctl_erred = False                         # #1059: the control lines ended on an ERR
-        self._yielded = None                            # (slot, tokens read): the last request on them gave way
+        # A03b (review r01, finding 3): the slot arrays, the ownership sets AND the generation counter swap as ONE
+        # step under slot_cv - the lock every picker, reaper and BDONE cleanup takes.  Without it a stale consumer's
+        # cleanup could bind the successor's fresh arrays while still holding the old generation's number (gen was
+        # bumped only after the swap), arm on the successor's queue, BSTOP its engine and free a slot it is decoding in.
+        with self.slot_cv:
+            # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
+            self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
+            self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
+            self.slot_groups = groups
+            # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
+            # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
+            # conversation cache - see pick_slot
+            groups_run = int(self.info.get("batch_groups") or groups)
+            self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
+            self.slot_q = [queue.Queue() for _ in range(self.batch)]
+            self.slot_busy = [False] * self.batch
+            # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
+            # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
+            # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
+            self.slot_claims: set[int] = set()
+            self.slot_releasing: set[int] = set()
+            # A03b: slots whose BDONE wait passed its 600 s deadline without a confirmed end.  The watcher keeps
+            # watching, but the deadline alone proves nothing about a still-live engine, so these slots stay busy,
+            # unpickable and untouchable by the orphan reaper until BDONE, EOF or the generation's end confirms.
+            self.slot_quarantine: set[int] = set()
+            self._orphan_seen: dict[int, float] = {}
+            # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
+            # the slot that has its start (the engine checks it again); when the slot was last used
+            self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+            self.slot_used = [0.0] * self.batch
+            self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
+            self.gen = self.__dict__.get("gen", 0) + 1  # which engine process this is (a request notes its own)
+            self._ctl_erred = False                     # #1059: the control lines ended on an ERR
+            self._ctl_end_consumed = None               # A03h r03: gen stamped when a control-line DONE was
+                                                        #  consumed - the marker ends the leg, the figures may fail
+            self._yielded = None                        # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+        start.pump, start.gen = self.pump, self.gen
+        with self._own:                          # validated publication: READY + pump, one step
+            self._published = start
+            self._start_tl.ctx = start
 
     def _pump(self):
-        proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
+        proc, lines = self.proc, getattr(self, "lines", None)   # this process's: a restart replaces both (#344)
+        if proc is None or lines is None:               # a close already took this generation away
+            return
         slot_q = self.slot_q
         line = None
         for line in proc.stdout:
@@ -989,12 +1052,17 @@ class StrataEngine:
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
-            if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
+            if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a slot's own lines
                 try:
-                    slot_q[int(line.split()[1])].put(line)
-                    continue
+                    s = int(line.split()[1])
                 except (IndexError, ValueError):
-                    pass
+                    continue                    # A03e: an unroutable slot word is DROPPED - decision: it is
+                                                #  not a control line either (a corrupt BDONE must not leak
+                                                #  into the _control/DONE stream, which ignores it anyway)
+                if 0 <= s < len(slot_q):        # A03e: the old slot_q[int(...)] wrapped NEGATIVE slots onto
+                    slot_q[s].put(line)         #  real ones (slot_q[-1]!) - a stream word "BDONE -1 ..."
+                    continue                    #  could spoof the last slot.  Out of range: dropped as well.
+                continue
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
@@ -1049,8 +1117,24 @@ class StrataEngine:
 
     def unload(self):
         """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
-        self.close()
-        self.unloaded = True
+        self._reap_finished()
+        with self._own:
+            flying = self._inflight_close
+            if flying is not None and flying.proc.poll() is None:
+                raise EngineStuck("this engine's process is still being ended; retry after it exits")
+            self._intent += 1                    # a start of an older generation must not bring it back
+            ctx = self._published
+            if ctx is None and flying is None and self.proc is not None:
+                ctx = _Start(self.proc, getattr(self, "log", None))
+                ctx.pump = getattr(self, "pump", None)
+            if ctx is not None:
+                self._published = None           # linearised: exactly one closes it
+                self._inflight_close = ctx
+        if ctx is not None:
+            self._close_proc(ctx)                # EngineStuck propagates: unloaded stays untouched
+        with self._own:
+            if self._published is None and self._inflight_close is None:
+                self.unloaded = True             # confirmed end AND still the owner: never the successor's flag
 
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
@@ -1076,9 +1160,11 @@ class StrataEngine:
         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
         (PR #637)."""
         info = dict(self.info)
+        with self._own:
+            intent = self._intent                # our own intent: a later unload/close changes it
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
-            self.close()
+            self._close_current()                # not close(): a restart must not void itself
             for i in range(tries):
                 # #344: not alive until READY - __init__ sets max_context to 0 and blocks until the engine says
                 # READY, and a request that saw alive() in that window skipped load() and failed with "context
@@ -1098,34 +1184,105 @@ class StrataEngine:
                           f"{self.RESTART_RETRY_S:g} s", flush=True)
                     time.sleep(self.RESTART_RETRY_S)
         finally:
-            self.starting = False
-            # a lazy first start never reached the post-READY __init__ where slot_cv is made (#1527)
-            if "slot_cv" in self.__dict__:
-                with self.slot_cv:               # #1012: wake the requests that waited through it: they go on with the
-                    self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
+            ctx = getattr(self._start_tl, "ctx", None)
+            with self._own:
+                mine = self._published is None or ctx is None or self._published is ctx
+            if mine:
+                self.starting = False
+                # a lazy first start never reached the post-READY __init__ where slot_cv is made (#1527)
+                if "slot_cv" in self.__dict__:
+                    with self.slot_cv:           # #1012: wake the requests that waited through it: they go on with the
+                        self.slot_cv.notify_all()  # new engine, or (it did not start) end with a clean EngineDied
+        ctx = getattr(self._start_tl, "ctx", None)
+        with self._own:                          # did a user unload/close overtake this restart?
+            superseded = self._intent != intent
+            mine = ctx is not None and self._published is ctx
+            if superseded and mine:
+                self._published = None
+        if superseded and mine:
+            self._close_proc(ctx)                # our own new process, never what is published now
+            return
+        if not mine:
+            return                               # a newer start owns the engine now: report nothing
         self.info = {**info, **self.info}
 
+    @staticmethod
+    def _done_num(f: str) -> int | None:
+        """A03h: a DONE-line counter - _num_field plus the printable %lld range: every DONE counter
+        is an int64_t (generate.cpp:14620-28 prints (long long) deltas, SYCL identical), so a word
+        beyond 2**63-1 has no printable source (the A03g r02 bound: grammar, not a cap).  A static
+        helper called through StrataEngine: test mock engines parse DONE lines UNBOUND
+        (StrataEngine._parse_done(mock, line)), so _parse_done depends on nothing of self but .last."""
+        v = StrataEngine._num_field(f)
+        return v if v is not None and v <= 0x7FFFFFFFFFFFFFFF else None
+
     def _parse_done(self, line):
+        # A03h: the engine's completion line read with the emitter's own grammar (CPU:14620/SYCL:11872):
+        # %lld counters (int64 deltas, all >= 0 at every call site), %.1f times and MB (finite, >= 0),
+        # finish = the four hard-coded words (_BDONE_FINISH).  NEVER fabricate: unicode digits, '+7',
+        # '007', beyond-%lld and inf/nan are not printable words, they read as malformed exactly like
+        # 'x' does today.  NEVER a half update: self.last is replaced by ONE finished dict, or not at
+        # all.  Malformed MANDATORY core raises StreamCorrupted (owner decision r02: engine fault, 503
+        # before the answer / API error event after it started) - and EVERY caller keeps the wire end:
+        # the DONE marker ends solo drains, control drains and the request alike, whatever the figures
+        # say (see generate()'s done-flag, its STOP drain, and _drain_control - a drain that raises
+        # there skipped ctl.release() and held the control lock, Codex counterexample r01).
+        # A malformed OPTIONAL group reads as that group being ABSENT - a DELIBERATE contract choice
+        # r02 documents (r01 called it "same as an older line", which is not identical: an older engine
+        # never printed the group, this one printed it wrongly): reused/prompt_read then fall back to
+        # their None paths (carry merge skipped, full prompt accounting), never to invented figures.
         f = line.split()
-        self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
-                     "decode_ms": float(f[4]), "finish": f[5]}
-        if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
-            self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
-        if len(f) >= 11:                                  # decode hit rate fields
-            self.last.update(hits=int(f[9]), lookups=int(f[10]))
-        if len(f) >= 14:                                  # the expert tiers (engine 0.1.31+): RAM / file blobs, file MB
-            self.last.update(ram_blobs=int(f[11]), file_blobs=int(f[12]), file_mb=float(f[13]))
-        if len(f) >= 15:                                  # #471 (engine 0.1.36+): the prompt tokens actually read
-            self.last.update(prompt_read=int(f[14]))
-        if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
-            self.last.update(offloaded=int(f[15]))
-        for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
-            key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
+        w = f + [""] * 6                                   # word reads never IndexError: all end as
+        gen, ptok = StrataEngine._done_num(w[1]), StrataEngine._done_num(w[2])   # malformed -> parent's
+        pms, dms = StrataEngine._float_field(w[3]), StrataEngine._float_field(w[4])  # raise path, one ValueError
+        fin = w[5] if w[5] in _BDONE_FINISH else None
+        if gen is None or ptok is None or pms is None or dms is None or fin is None:
+            # A03h r02, OWNER decision (DISCUSSION codex-A03h-owner-rework-confirmed-20261022): a mandatory
+            # DONE the emitter cannot print is an ENGINE fault - StreamCorrupted, the A03f family:
+            # 503 server_error before the answer starts, an API error event after it has started
+            # (mapping 6050/6459; never the 400 handler, never a token).
+            raise StreamCorrupted(f"the DONE line is not something the engine can print: {line[:80]!r}")
+        out = {"generated": gen, "prompt_tokens": ptok, "prompt_ms": pms, "decode_ms": dms, "finish": fin}
+        ok = True
+        if ok and len(f) >= 9:                             # the conversation cache's fields (engine 0.1.3+)
+            v = [StrataEngine._done_num(f[i]) for i in (6, 7, 8)]
+            if all(x is not None for x in v):
+                out.update(drafts_accepted=v[0], drafts_offered=v[1], reused=v[2])
+            else:
+                ok = False                                 # a lying group is an absent group, never half
+        if ok and len(f) >= 11:                            # decode hit rate fields
+            v = [StrataEngine._done_num(f[i]) for i in (9, 10)]
+            if all(x is not None for x in v):
+                out.update(hits=v[0], lookups=v[1])
+            else:
+                ok = False
+        if ok and len(f) >= 14:                            # the expert tiers (engine 0.1.31+): RAM / file blobs, file MB
+            v = (StrataEngine._done_num(f[11]), StrataEngine._done_num(f[12]), StrataEngine._float_field(f[13]))
+            if all(x is not None for x in v):
+                out.update(ram_blobs=v[0], file_blobs=v[1], file_mb=v[2])
+            else:
+                ok = False
+        if ok and len(f) >= 15:                            # #471 (engine 0.1.36+): the prompt tokens actually read
+            v = StrataEngine._done_num(f[14])
+            if v is not None:
+                out["prompt_read"] = v
+            else:
+                ok = False
+        if ok and len(f) >= 16:                            # #588 (engine 0.1.39+): routed experts read over PCIe
+            v = StrataEngine._done_num(f[15])
+            if v is not None:
+                out["offloaded"] = v
+            else:
+                ok = False
+        # key=value fields after the positional ones (the prompt's first chunk and its streamed expert
+        # blobs); the --lookup-chain group's five numbers sit positional here and stay unread, as always.
+        for tok in f[16:]:
+            key, eq, value = tok.partition("=")
             if eq and key in ("chunk", "experts_streamed"):
-                try:
-                    self.last[key] = int(value)
-                except ValueError:
-                    pass
+                v = StrataEngine._done_num(value)
+                if v is not None:
+                    out[key] = v
+        self.last = out                                    # A03h: the finished dict, or no update at all
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -1281,11 +1438,10 @@ class StrataEngine:
                     stopped = True
                 yield False                              # a token is pending (not a heartbeat)
             elif line.startswith("PP "):
-                f = line.split()
-                if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                    self.progress = (int(f[1]), int(f[2]))
-                    self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
-                    self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                prog, ms, rate = self._pp_fields(line.split())   # A03g: never raises, never fabricates
+                if prog is not None:
+                    self.progress = prog
+                    self.progress_ms, self.prefill_tok_s_mean = ms, rate
                 if not stopped and cancel.is_set():
                     # #879: a Stop during the prompt read went out only after the first token (or after 10 s of
                     # silence, which a stream of PP lines never allows): the engine read the whole prompt first
@@ -1293,6 +1449,14 @@ class StrataEngine:
                     stopped = True
                 yield None
             elif line.startswith("DONE"):
+                # A03h r03 (Codex single-DONE counterexample): the wire's END marker is consumed
+                # BEFORE the risky figures are read - stamped with the generation, so the batch
+                # caller's finally knows that this leg's end is spent.  r01/r02 raised inside
+                # _parse_done here, _last_done/_ctl_result stayed unset, phase stayed "solo" and
+                # the finally STOP+drained AGAIN onto a silence the end had already delivered
+                # (300 s default with ctl held).  The lying figures still raise: the request
+                # fails as the engine fault - only the drain is what the marker forbids now.
+                self._ctl_end_consumed = getattr(self, "gen", None)
                 self._parse_done(line)
                 self._last_done = line
             elif line.startswith("BADM "):
@@ -1301,8 +1465,21 @@ class StrataEngine:
                 return
             elif line.startswith("YIELDED "):            # the read gave way (BYIELD): <slot> <tokens read>
                 f = line.split()
-                if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
-                    self._yielded = (int(f[1]), int(f[2]))
+                if len(f) >= 3:
+                    # A03g: NO emitter source for a negative slot word: yielded_at and yielded_slot are
+                    # assigned ONLY as a pair at a real give-way and the line prints just for
+                    # yielded_at >= 0 (the initial -1 never reaches the wire: generate.cpp:12751-52/
+                    # 12842-43/14619, SYCL identical) - so the old lstrip('-') was no solo sentinel
+                    # but a hole feeding int() a negative; '²'/'٧'/'01' go through _num_field (never
+                    # raise, never fabricate). Containment stays where the parent had it (unchanged):
+                    # the solo/batch hand-back branches bind the field to this request's reserved/own
+                    # slot (never negative), and an own-slot claim's held prefix is overwritten by its
+                    # own re-admission before use.  The one leak the lstrip leniency could still cause:
+                    # a stale (-1, q) surviving DONE into the NEXT admission round's held-overwrite -
+                    # removing the leniency closes that remnant; own/foreign pins cover the rest.
+                    s, q = self._num_field(f[1]), self._num_field(f[2])
+                    if s is not None and q is not None:
+                        self._yielded = (s, q)
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
                 raise ValueError(line[4:].strip())
@@ -1332,76 +1509,307 @@ class StrataEngine:
             if line is None:
                 return None
             if line.startswith("DONE"):
-                self._parse_done(line)
+                # A03h r02 (Codex counterexample, control solo leg): the drain's parse must NEVER
+                # raise - it runs inside the request's finally; a raising DONE skipped the rest of
+                # that finally (ctl.release(), admit/reserved bookkeeping) and HELD the control lock
+                # for every later request. The end line ends the drain whatever its figures say;
+                # a lying end leg's figures read as absent (self.last untouched), logged once.
+                try:
+                    self._parse_done(line)
+                except StreamCorrupted as ex:
+                    print(f"[strata] {ex}", flush=True)
             if line.startswith(until) or line.startswith("ERR"):
                 return line
         return None
 
-    def _apply_bdone(self, f: list[str]) -> None:
-        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures."""
-        if len(f) >= 5 and isinstance(self.last, dict):
-            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
-                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+    @staticmethod
+    def _num_field(f: str) -> int | None:
+        """A03e r03: strict ASCII decimal, converted SAFE - the classifier must never raise on a
+        malformed wire field.  `isdigit()` alone is not an ASCII guarantee: some Unicode digits pass
+        it, and int() then either RAISES ValueError (superscript '²') or SILENTLY PARSES a figure
+        (Arabic-Indic '٧' -> 7 - the subtler poison: no exception, a fabricated figure); CPython also
+        raises past its 4300-digit conversion limit.  An exception thrown from a consumer aborts the
+        caller's finally and leaks the slot busy AND claimed with nobody watching (Codex handoff
+        probe), and a silently parsed digit fabricates tokens/figures.  Leading zeros are rejected -
+        printf %d/%lld never prints them."""
+        if not (f.isascii() and f.isdigit()):
+            return None
+        try:
+            v = int(f)
+        except ValueError:                                  # the digit-count limit ('9'*6000) etc.
+            return None
+        return v if f == str(v) else None
 
-    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
+    @classmethod
+    def _pp_fields(cls, f: list[str]):
+        """A03g: one PP line as the emitter prints it - `PP %lld %lld %.0f %.1f` (generate.cpp:9297/
+        12511/12572/13422, SYCL identical).  The two counters are BOTH-or-nothing (progress is a
+        pair; a half pair would fake a position); ms and rate are per-field optional - the historical
+        3-field and the forward 5-field shape read exactly as today, and a MALFORMED float word means
+        that FIELD IS ABSENT (0.0 / None), never a poisoned figure and never an exception: bare
+        float() today accepts 'x' (raises -> the 400 handler blames the client) and PARSES 'inf'/
+        'nan'.  Like the BDONE/BT classifiers this gate sees fields the CALLER split(), so a doubled
+        space collapses before it and is accepted as a recorded decision (printf never prints one).
+        Returns ((read, total) | None, ms, rate | None)."""
+        prog = None
+        if len(f) >= 3:
+            p, t = cls._num_field(f[1]), cls._num_field(f[2])
+            # r02 (Codex probe): bounded to printf %lld's OWN printable range - the arguments are
+            # int64_t (generate.cpp:9297 etc.), so a canonical-but-unprintable word (10**1000) has
+            # no emitter source AND fed the solo #481 math an OverflowError (int too large for
+            # float).  Grammar bound like A03f's %d ceiling, not an arbitrary cap; the pair stays
+            # both-or-nothing, so an unprintable counter simply reads as "no update".
+            if p is not None and t is not None and p <= 2 ** 63 - 1 and t <= 2 ** 63 - 1:
+                prog = (p, t)
+        ms = cls._float_field(f[3]) if len(f) >= 4 else 0.0
+        rate = cls._float_field(f[4]) if len(f) >= 5 else None
+        return prog, (0.0 if ms is None else ms), rate
+
+    @staticmethod
+    def _float_field(f: str) -> float | None:
+        """A03g: the safe reading of an emitter's `%.0f`/`%.1f` word (PP's ms and rate): an ASCII gate
+        first (float() reads Unicode digits as figures - '٧' -> 7.0 - a fabricated figure), then the
+        value must be finite and >= 0 (the emitter prints clock differences and guarded quotients:
+        never NaN, never inf, never negative); None = malformed, NEVER an exception.  Exponent and
+        underscore spellings stay accepted (finite, numerically true, printf never prints them - the
+        same recorded decision as the A03e r03 ms field).  Today's bare float() PARSES 'inf'/'nan':
+        an infinite progress_ms dies in prompt_progress' int() (that path lives only at batch=0) with
+        an unmapped OverflowError, and an infinite prefill_tok_s_mean lands as the literal 'Infinity'
+        in the /status and /metrics JSON."""
+        if not f.isascii():
+            return None
+        try:
+            v = float(f)
+        except ValueError:
+            return None
+        return v if v >= 0.0 and v == v and v != float("inf") else None
+
+    @classmethod
+    def _bdone_valid(cls, f: list[str], slot: int | None = None) -> bool:
+        """A03e: is this split line a BDONE record the NATIVE emitter can actually print?  Five fields,
+        non-negative decimal slot and produced, a finish from the emitter's vocabulary, a finite ms >= 0.
+        A COMPLETE record that lost only its trailing newline (killed at the very end of the line) stays
+        valid - it is the whole truth about that slot's window.  A truncated or altered record is NOT an
+        end signal at all: no consumer may confirm an end, apply figures, cache a tail or send anything on
+        it; the real end (a valid BDONE / nonfinite / the pump's EOF) or the A03b quarantine decides.
+        `slot`: the consumer's bound slot - a perfect record FOR ANOTHER slot is not this one's end
+        (the pump routes by the field, but a stream corruption must not spoof a watcher or a decode).
+        Field-wise note (r03): the classifier sees fields the CALLER split() - a doubled space collapses
+        before it and cannot be detected here; printf can never print one, so that spelling is accepted
+        as a recorded decision, not policy.  ms goes through an ASCII gate first: float() accepts Unicode
+        digits ('٧.٠' -> 7.0) and that leniency would forge figures; exponents/underscores stay accepted
+        (finite, numerically true, printf never prints them)."""
+        if len(f) != 5 or f[0] != "BDONE" or f[3] not in _BDONE_FINISH:
+            return False
+        s = StrataEngine._num_field(f[1])
+        if s is None or StrataEngine._num_field(f[2]) is None:
+            return False
+        if slot is not None and s != slot:
+            return False
+        if not f[4].isascii():
+            return False
+        try:
+            ms = float(f[4])
+        except ValueError:
+            return False
+        return ms >= 0.0 and ms == ms and ms != float("inf")   # rejects NaN and +/-inf spellings
+
+    @classmethod
+    def _bt_field(cls, f: list[str], slot: int) -> int | None:
+        """A03f: is this split line a BT token line the NATIVE emitter can print?  It prints exactly
+        `std::printf("BT %d %d\\n", b, (int) y)` (generate.cpp:10997 and :11172) and the sampler's argmax
+        yields y in [0, n_vocab) (sampler.dp.cpp:176-180), so: three fields, the slot as canonical
+        non-negative decimal equal to THIS consumer's bound slot, the token the same way and never above
+        INT32_MAX - that ceiling is printf %d's own range, an emitter-grammar fact; deliberately NO
+        vocabulary-size cap (the server must not assume the pack's vocab).  Like the BDONE classifier
+        this gate sees fields the CALLER split(), so a doubled space collapses before it and is ACCEPTED
+        as a recorded decision (printf never prints one) - pinned in the matrix.  None = wire corruption: it is
+        never a token, and the caller ends the request as an engine-side fault (StreamCorrupted), never a
+        client 400 (int() on this line would raise for 'x' or a missing field - the 400 handlers blame the
+        request body - and would PARSE a unicode digit: int('٧') == 7 fabricates a token silently)."""
+        if len(f) != 3 or f[0] != "BT":
+            return None
+        s = cls._num_field(f[1])
+        if s is None or s != slot:
+            return None
+        t = cls._num_field(f[2])
+        if t is None or t > 0x7FFFFFFF:
+            return None
+        return t
+
+    def _apply_bdone(self, f: list[str]) -> None:
+        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures.  A03e: every caller has
+        validated `f` with _bdone_valid first - the grammar is checked THERE, once, so no figure here can
+        be NaN/inf or a truncated remnant; the len/isdigit guards below stay as the last defensive line."""
+        if len(f) >= 5 and isinstance(self.last, dict):
+            n = self._num_field(f[2])              # r03: same safe conversion as the classifier - even
+            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
+                         "generated": n if n is not None else self.last.get("generated")}
+
+    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0, born: int | None = None):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
         in the same window).  Read it here, so the request's figures are the slot leg's (the background wait would eat it,
-        and the request kept the admission's single token).  None when it does not come in `wait_s`: then the background
-        wait takes over."""
-        if slot >= len(self.slot_q):
-            return None
+        and the request kept the admission's single token).  A03c: the read-back binds the queue of ITS OWN engine
+        generation, once, under slot_cv - restart() swaps all slot arrays AND the generation counter as one step under
+        that very lock (A03b r02), so the bound queue can never be a successor's: an old consumer may not drain a
+        successor's BT/BDONE lines, may not index a shrunken successor array, and the whole wait stays on the old queue
+        (the old pump keeps writing THERE).  `born` is the request's own generation from the caller's finally, like
+        A03b's cleanup; without it the current one is assumed.
+        A03d returns one of four states, never a bare truth value: (_END_BDONE, the line) - this generation
+        ended with its figures; (_END_EOF, None) - OUR queue's pump EOF, i.e. that engine's end is CONFIRMED
+        but there is no line; (_END_NONE, None) - no end signal within `wait_s` (timeout/Empty);
+        (_END_GONE, None) - bound nothing, read nothing: the request's generation is gone OR its slot
+        index fell off OUR arrays (a shrunk batch within the same generation - the caller's arm then
+        re-checks the same guard and lands empty too)."""
+        if born is None:
+            born = self.gen
+        with self.slot_cv:                                  # bind ONLY - the blocking reads below run WITHOUT
+            if self.gen != born or slot >= len(self.slot_q):    # the lock (contract: no blocking read under
+                return _END_GONE, None                      #  slot_cv); the swap's own step already holds it
+            q = self.slot_q[slot]                           # and stays OURS for the whole wait
         end = time.monotonic() + wait_s
         while time.monotonic() < end:
             try:
-                line = self.slot_q[slot].get(timeout=max(0.05, end - time.monotonic()))
+                line = q.get(timeout=max(0.05, end - time.monotonic()))
             except queue.Empty:
-                return None
+                return _END_NONE, None
             if line is None:
-                return None
+                return _END_EOF, None                       # OUR pump's EOF: that engine is gone, no line left
             if line.startswith("BDONE "):
-                return line
-        return None
+                # A03e: only a complete record FOR THIS SLOT ends the read-back; a malformed word is
+                # consumed and skipped - the real BDONE or the EOF behind it answers (contract: an
+                # invalid record may never confirm an end or drive bdone_in bookkeeping).  Residual by
+                # design: this arm cannot check the BT-count parity (it does not own the BT stream) - a
+                # grammatically perfect forgery with a wrong produced that arrives BEFORE the real
+                # record would end it; reachable only through stream corruption, recorded as accepted
+                # residual risk (a wire nonce would be the engine-side cure - owner decision, not here).
+                if self._bdone_valid(line.split(), slot=slot):
+                    return _END_BDONE, line
+        return _END_NONE, None
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
+    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, born: int | None = None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
-        come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
+        come before BDONE, all but the last are what the slot holds then (the next turn of its conversation).
+        `born`: the generation the calling request was served on - a cleanup of an old generation never arms on a
+        successor's arrays, sets or queue (pass it from the caller's finally; without it the current gen is used).
+        A03b: the 600 s deadline is NOT an end.  A live engine still decoding in that slot must never hand it to a
+        new request because its watcher grew impatient, so past the deadline the slot goes into quarantine: it stays
+        busy, unpickable and untouchable by the orphan reaper, and cache retention is given up (a deadline invents no
+        cache state).  A watcher keeps draining; after a watcher FAILURE exactly one replacement takes over
+        (bounded) and gives cache retention up entirely - only a healthy first watcher may close with a
+        positive cache.  Only a confirmed end - BDONE, a nonfinite BDONE, the pump's EOF or the generation's own
+        end - releases; every failure path leaves the quarantine lock standing instead."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
             return
-        try:
-            self._send(f"BSTOP {slot}")
-        except EngineDied:
-            pass
-        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
-        releasing = self.slot_releasing
-        releasing.add(slot)
+        with self.slot_cv:                              # A03b: check, mark and bind as one cv-held step (restart()
+            if born is None:                            #  swaps its arrays under the same lock now, finding 3): a
+                born = self.gen                         #  cleanup born into another generation never marks, binds
+            if self.gen != born:                        #  or arms on the successor's arrays, sets or queue.  A
+                return                                  #  BSTOP that nonetheless reached a successor engine would
+            if slot >= len(self.slot_q):                #  need this thread descheduled across a whole close()+
+                return                                  #  spawn+READY - documented residual, flagged to review.
+            if slot in self.slot_releasing or slot in self.slot_quarantine:
+                return                                  #  either way another cleanup of the same slot in the
+                                                        #  same generation must not double-drain or BSTOP again.
+            self.slot_releasing.add(slot)               #  marked before the thread can even start: no window in
+            q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   #  which pick/reaper see a bare
+            releasing, quarantine = self.slot_releasing, self.slot_quarantine   #  busy slot; restart() replaces all
 
-        def wait():
-            end = time.monotonic() + 600.0
-            tail = list(stream or [])
-            while time.monotonic() < end:
+        end = time.monotonic() + 600.0                  # A03b r04/r05 (Codex P2): the deadline anchors at the ARM
+        #  of this slot-and-generation's cleanup - both the original and the one replacement watcher share it, so
+        #  a late confirmation after an internal watcher failure still closes conservatively (held=[]).
+
+        def wait(retry=False):
+            try:                                        # A03b r04 (Codex P1): a WATCHER ERROR IS NOT A CONFIRMED
+                _watch(retain=not retry)                #  END - the slot must never land in the #1603 orphan
+                #  reaper while its engine may still live in it.  A03b r06 (Codex): the REPLACEMENT also gives
+                #  cache retention up from the start - a crash between q.get and the tail append can have
+                #  eaten an already dequeued BT line, so a freshly rebuilt tail could close POSITIVE with a
+                #  sequence that is not a prefix of the real token history (their probe: held=[104,105,67]
+                #  where reality said [104,105,65,66,67]).  Conservative [] on any replacement-confirmed end
+                #  is the agreed rule; the healthy first watcher keeps parent-parity retention.
+            except Exception as exc:                    #  reaper while its engine may still live in it: the
+                with self.slot_cv:                      #  quarantine lock stands (busy unpickable, reaper skips
+                    releasing.discard(slot)             #  it, the set says who was last responsible), releasing
+                    quarantine.add(slot)                #  drops because no watcher answers for it any more.
+                    self.slot_cv.notify_all()
+                print(f"[strata] slot {slot}: its BDONE watcher failed ({exc!r}) - the slot stays quarantined "
+                      f"until a confirmed end or the generation's end, NOT handed to the orphan reaper", flush=True)
+                if not retry:                           # bounded repair of responsibility: exactly ONE
+                    try:                                #  replacement watcher per slot and generation; if it
+                        threading.Thread(target=wait, kwargs={"retry": True}, daemon=True).start()
+                    except Exception as exc2:           #  fails too, the lock simply stands until restart
+                        print(f"[strata] slot {slot}: its replacement watcher could not start ({exc2!r})", flush=True)
+
+        def _watch(retain=True):
+            tail = list(stream or []) if retain else None   # None from the deadline on - and, r06, from a
+            quarantined = False                         #  watcher FAILURE on: no partial-history positives
+            while True:
+                if self.gen != born:                    # our engine generation is gone; restart() replaced the
+                    return                              #  arrays and queues and its EOF lands on the old queue
+                                                        #  anyway - not one write into a successor's state
+                if not quarantined and time.monotonic() >= end:
+                    quarantined = True                  # the deadline proves silence, not an ended decode
+                    with self.slot_cv:
+                        quarantine.add(slot)
+                    tail = None                         # bounded: no unbounded tail retention behind the deadline
+                    print(f"[strata] slot {slot}: its engine has not said BDONE within 600 s - the slot stays "
+                          f"quarantined (busy, unpickable, not an orphan) until that engine ends it (issue #1603)",
+                          flush=True)
                 try:
-                    line = q.get(timeout=5.0)
+                    line = q.get(timeout=5.0)           # the one controlled drain; 5 s polls, no busyloop
                 except queue.Empty:
                     continue
+                if not quarantined and time.monotonic() >= end:
+                    # A03b r04 (Codex P2): the POLL itself crossed the deadline (it began before 600 and the
+                    # line came back at/after it) - retention ends at the deadline, not at the next loop top,
+                    # so a BDONE returning at 600/601 still finishes conservatively with held=[] as agreed.
+                    quarantined = True
+                    with self.slot_cv:
+                        quarantine.add(slot)
+                    tail = None
+                    print(f"[strata] slot {slot}: its engine has not said BDONE within 600 s - the slot stays "
+                          f"quarantined (busy, unpickable, not an orphan) until that engine ends it (issue #1603)",
+                          flush=True)
                 if line is None:
-                    tail = []
+                    tail = None                         # our own pump's EOF: that engine is confirmed gone
                     break
                 if line.startswith("BT "):
-                    try:
-                        tail.append(int(line.split()[2]))
-                    except (IndexError, ValueError):
-                        tail = []
+                    if tail is not None:
+                        try:
+                            tail.append(int(line.split()[2]))
+                        except (IndexError, ValueError):
+                            tail = []
                 if line.startswith("BDONE "):
-                    if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
-                        tail = []
-                    break
-            held[slot] = tail[:-1] if stream and tail else []
+                    # A03e: a malformed or foreign-slot BDONE word is NOT an end record - ignore it and
+                    # keep watching (the deadline/quarantine contract is untouched); only the emitter's
+                    # own grammar for THIS slot, or the EOF, may confirm.
+                    f = line.split()
+                    if not self._bdone_valid(f, slot=slot):
+                        continue
+                    if f[3] == "nonfinite":                # #879: the engine dropped the slot's state
+                        tail = None                        # no positive cache state behind it, quarantine or not
+                    break                                  # confirmed end - the only way past this loop is confirmed
             with self.slot_cv:
+                held[slot] = tail[:-1] if stream and tail else []
                 busy[slot] = False
                 releasing.discard(slot)
+                quarantine.discard(slot)
                 self.slot_cv.notify_all()
-        threading.Thread(target=wait, daemon=True).start()
+        try:
+            try:
+                self._send(f"BSTOP {slot}")             # exactly one BSTOP per slot and generation
+            except EngineDied:
+                pass                                    # that engine is already gone: its EOF lands on the queue
+            threading.Thread(target=wait, daemon=True).start()
+        except Exception:                               # A03b r04 (Codex P1): a failed arm must not free or
+            with self.slot_cv:                          #  strand a live slot either: releasing drops (nobody
+                releasing.discard(slot)                 #  is watching) but the QUARANTINE lock stands - safety
+                quarantine.add(slot)                    #  over availability, resolved only by a confirmed end
+                self.slot_cv.notify_all()               #  of this slot or by the next engine generation.
+            raise                                       #  (the caller's finally then skips its claims.discard:
+                                                        #   the slot stays busy AND claimed AND quarantined)
 
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
     SLOT_PARK_S = 2.0        # ... and how long a refused slot stays out of the picks
@@ -1434,7 +1842,9 @@ class StrataEngine:
         now = time.monotonic()
         freed = []
         for b, busy in enumerate(self.slot_busy):
-            if busy and b not in self.slot_claims and b not in self.slot_releasing:
+            # A03b: a quarantined slot (BDONE deadline passed, end unconfirmed) is never an orphan - its watcher is
+            # still responsible for it, and freeing it here would hand a possibly still-busy engine slot to a request
+            if busy and b not in self.slot_claims and b not in self.slot_releasing and b not in self.slot_quarantine:
                 first = self._orphan_seen.setdefault(b, now)
                 if now - first >= self.ORPHAN_SLOT_S:
                     self.slot_busy[b] = False
@@ -1575,6 +1985,8 @@ class StrataEngine:
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+                    self._ctl_end_consumed = None      # A03h r03: per-leg - a stale end stamp from an
+                                                       #  earlier leg may never gate THIS leg's drain
                     self._ctl_erred = False
                     def others():
                         with self.slot_cv:
@@ -1682,6 +2094,12 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
+                    btw = 0                                     # A03e: BT lines of THIS admission's window -
+                                                                #  the emitter's invariant: every produced
+                                                                #  token is exactly one BT line (generate.cpp
+                                                                #  printf BT then ++sl.produced), and the
+                                                                #  continued admission counts its fed token as
+                                                                #  produced 1 (14650) without printing a BT
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
@@ -1746,21 +2164,43 @@ class StrataEngine:
                 live.update(state="decoding", first_token=time.time(), generated=len(out))
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
-                while True:
-                    try:
-                        line = self.slot_q[slot].get(timeout=10.0)
-                    except queue.Empty:
+                beat = time.monotonic()
+
+                def gone() -> EngineDied:               # A03 review r02: a vanished engine generation.  Raise
+                    return EngineDied(f"the engine was replaced during this request "
+                                      f"(generation {born} is gone)")    #  WITHOUT exit_code(): proc is the
+                                                                        #  successor's now, wait() on it would
+                                                                        #  block this thread for seconds.
+                q = self.slot_q[slot]                   # A03 review r02: this decode binds to THIS engine
+                while True:                             #  process's queue - restart() replaces self.slot_q and
+                    if self.gen != born:                #  the slot arrays, while this request's own pump EOF
+                        raise gone()                    #  None lands in the OLD queues.  The successor's queue
+                    try:                                #  is never this consumer's to read, stop, rewrite or
+                        line = q.get(timeout=0.5)       #  free.  A03a: bounded wait, the solo path's pattern -
+                    except queue.Empty:                 #  a cancel must not hide behind a silent queue for the
+                        if self.gen != born:            #  old 10 s timeout; no BSTOP for a vanished generation.
+                            raise gone()
                         if cancel.is_set() and not stop_sent:
                             self._send(f"BSTOP {slot}")
                             stop_sent = True
-                        yield None
-                        continue
+                        if time.monotonic() - beat >= 10.0:
+                            beat = time.monotonic()
+                            yield None                              # the quiet 10 s heartbeat, unchanged: the
+                        continue                                    #  faster polling does not add to it
+                    if self.gen != born:                    # a leftover line raced in just as the generation
+                        raise gone()                        #  changed: it is applied to nothing
+                    beat = time.monotonic()                         # any line of this slot ends the silence
                     if line is None:
                         phase = "none"
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                     if line.startswith("BT "):
-                        t = int(line.split()[2])
-                        out.append(t)
+                        t = self._bt_field(line.split(), slot)    # A03f: grammar AND slot binding.  A token
+                        if t is None:                             #  line the emitter cannot print is an
+                            raise StreamCorrupted(                #  ENGINE-side wire fault: never a client
+                                "the engine's token line for slot "   #  400, never a fabricated token; the
+                                f"{slot} violated the BT wire grammar") #  finally keeps the A03b chain
+                        out.append(t)                             #  (arm/BSTOP/watcher) untouched
+                        btw += 1                                # A03e: one BT per produced token (emitter)
                         live["generated"] = len(out)
                         if cancel.is_set():
                             if not stop_sent:
@@ -1768,13 +2208,21 @@ class StrataEngine:
                                 stop_sent = True
                             continue
                         yield t
+                        if self.gen != born:            # A03 review r02 (own r02 re-review found this): a pause
+                            raise gone()                #  at this yield must not let _may_go_solo read the
                         if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
                                                                                   embeddings):
                             self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
                             going_solo = True
                     elif line.startswith("BDONE "):
-                        phase = "none"
                         f = line.split()
+                        if not self._bdone_valid(f, slot=slot) or f[2] not in (str(btw), str(btw + 1)):
+                            # A03e: grammar AND the emitter's BT-count invariant.  A forged "BDONE 1 99
+                            # stop 7.0" landing mid-decode is perfect JSON-of-wire but names a produced
+                            # count the stream never emitted: it ends nothing, fabricates nothing.
+                            continue                              #  no figures, no cache, no phase change -
+                                                                  #  the decode reads on to the real record
+                        phase = "none"
                         self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
@@ -1808,6 +2256,14 @@ class StrataEngine:
                     phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
                 if phase in ("solo", "admit") and self._ctl_erred:
                     phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
+                if phase == "solo" and getattr(self, "_ctl_end_consumed", None) == born:
+                    phase = "none"                      # A03h r03 (Codex single-DONE probe): THIS leg's DONE
+                                                        #  was already consumed by _control (marker stamped at
+                                                        #  the word, before the figures): a lying figure must not
+                                                        #  send a second STOP or drain into the silence the end
+                                                        #  already delivered - ctl.release follows immediately.
+                                                        #  Per-leg reset + gen stamp: no blanket equation of any
+                                                        #  StreamCorrupted with a finished admission.
                 if phase == "solo":
                     self._send("STOP")
                     self._drain_control("DONE", born=born)
@@ -1817,46 +2273,82 @@ class StrataEngine:
                         phase = "slot"
             except EngineDied:
                 pass
-            bdone_in = False
-            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
-                bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
-                if bd is not None:
-                    self._apply_bdone(bd.split())
-                    bdone_in = True
-            if reused0 is not None and isinstance(self.last, dict):
-                self.last = {**self.last, "reused": reused0}
-            if carry and isinstance(self.last, dict):
-                self.last = add_carry(carry, self.last)
+            bdone_in = eof_in = False
+            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS:
+                # A03c: no gen gate HERE (it was the unlocked check-then-act this package fixes): the
+                # read-back binds the queue of the request's own generation under slot_cv, and the
+                # figures below land as ONE checked step against the restart's atomic swap.
+                kind, payload = self._bdone_after_eos(slot, born=born)   # (#1869) the slot's figures, not
+                if kind == _END_BDONE:                                   #  the admission's; A03d states
+                    with self.slot_cv:                      # A03c: check+write ONE step against the swap:
+                        if self.gen == born:                #  a generation that ended after the read drops
+                            self._apply_bdone(payload.split())   #  its figures instead of driving bdone_in/slot
+                            bdone_in = True                 #  bookkeeping for an engine that is gone
+                elif kind == _END_EOF:
+                    eof_in = True                           # A03d: OUR queue's EOF was consumed right here -
+                                                            #  that engine's end is CONFIRMED, and the ONE end
+                                                            #  signal is already spent: a BDONE wait armed now
+                                                            #  would poll for a signal that no longer exists
+            if reused0 is not None and isinstance(self.last, dict) and self.gen == born:
+                self.last = {**self.last, "reused": reused0}   # A03 review r02: self.last is the CURRENT
+            if carry and isinstance(self.last, dict) and self.gen == born:   #  generation's - a gone leg's
+                self.last = add_carry(carry, self.last)        #  figures never merge into the successor's
             if holding:
                 self.ctl.release()
             if admit_wait:
                 with self.slot_cv:
                     self.admitting = max(0, self.admitting - 1)
-            if reserved is not None:
+            if reserved is not None:                            # (the successor owns its busy/claim arrays; A03b:
+                with self.slot_cv:                              #  the swap is atomic under this cv now, so the
+                    if self.gen == born:                        #  check belongs inside the lock, not before it)
+                        self.slot_busy[reserved] = False
+                        self.slot_claims.discard(reserved)
+                        self.slot_cv.notify_all()
+            if slot is not None and self.gen != born:
+                pass                                    # A03 review r02: a restart replaced the slot arrays and
+                                                        #  queues - the successor generation owns them now, this
+                                                        #  consumer never stops, frees or rewrites a slot of a
+                                                        #  generation it was not born into
+            elif slot is not None:
+                # A03b (review r01 finding 3, contract names Live/Used/Held): the gen-skip gate above is not the
+                # last word - restart() swaps all of these atomically under slot_cv, so every write below
+                # re-checks inside the lock it already takes; a restart racing in right after the gate above
+                # lands either before every with (then each re-check skips) or after it (then every write was
+                # ours, old gen).
                 with self.slot_cv:
-                    self.slot_busy[reserved] = False
-                    self.slot_claims.discard(reserved)
-                    self.slot_cv.notify_all()
-            if slot is not None:
-                self.slot_live[slot] = None
-                self.slot_used[slot] = time.time()
+                    if self.gen == born:
+                        self.slot_live[slot] = None
+                        self.slot_used[slot] = time.time()
                 if phase == "slot" and bdone_in:
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
                     with self.slot_cv:
-                        self.slot_busy[slot] = False
-                        self.slot_claims.discard(slot)
-                        self.slot_cv.notify_all()
+                        if self.gen == born:
+                            self.slot_held[slot] = stream[:-1] if stream else []   # as the BDONE wait leaves it
+                            self.slot_busy[slot] = False
+                            self.slot_claims.discard(slot)
+                            self.slot_cv.notify_all()
+                elif phase == "slot" and eof_in:                # A03d: confirmed end without a line: close
+                    with self.slot_cv:                          #  CONSERVATIVELY - empty held (EOF invents no
+                        if self.gen == born:                    #  cache, and a consumed EOF leaves nothing to
+                            self.slot_held[slot] = []           #  rebuild one from), no BDONE wait armed (the
+                            self.slot_busy[slot] = False        #  end signal is spent), no BSTOP (that engine
+                            self.slot_claims.discard(slot)      #  is already gone), waiting watchers woken.
+                            self.slot_cv.notify_all()
                 elif phase == "slot":
-                    self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
+                    with self.slot_cv:                            # parent's order kept: clear held BEFORE arming,
+                        if self.gen == born:                      #  or a watcher that confirms fast (its positive
+                            self.slot_held[slot] = []             #  tail) would be clobbered by a late write here
+                    self._release_slot_when_done(slot, stream, born=born)   # freed at its BDONE: the entry
+                    with self.slot_cv:                            #  re-checks born under the same lock; a racing
+                        if self.gen == born:                      #  restart already owns claims (the armed
+                            self.slot_claims.discard(slot)        #  BDONE wait marks releasing instead)
                 else:
                     with self.slot_cv:
-                        self.slot_busy[slot] = False
-                        self.slot_claims.discard(slot)
-                        self.slot_cv.notify_all()
+                        if self.gen == born:
+                            self.slot_busy[slot] = False
+                            self.slot_claims.discard(slot)
+                            self.slot_cv.notify_all()
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
@@ -1989,15 +2481,22 @@ class StrataEngine:
                         return
                     yield int(line[2:])
                 elif line.startswith("PP "):
-                    f = line.split()
-                    if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                        self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
-                        self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
-                        self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
-                        rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
-                        read_to = int(f[1])
-                        if silence > 0 and rate > 0 and chunk > 0:   # #481: the next chunk, as long as this one
-                            allow = max(silence, PP_SLACK * chunk / rate)
+                    prog, ms, rate = self._pp_fields(line.split())   # A03g: never raises, never fabricates
+                    if prog is not None:
+                        self.progress = prog                             # prompt progress, one per chunk: also a heartbeat (the
+                        self.progress_ms, self.prefill_tok_s_mean = ms, rate
+                        chunk = prog[0] - read_to
+                        read_to = prog[0]
+                        if silence > 0 and rate is not None and rate > 0 and chunk > 0:   # #481: the next chunk, as long as this one
+                            # r02 (Codex probe): a finite rate can still DIVIDE TO inf (5e-324);
+                            # an inf allow would disarm the silence deadline for this request.
+                            # chunk is %lld-bounded in _pp_fields, so the product can only run
+                            # away to inf, never raise - and a non-finite result NEVER replaces
+                            # the finite deadline (the word reads as absent, like today's missing
+                            # 5th field).  Same formula, same policy, no caps.
+                            a = PP_SLACK * chunk / rate
+                            if math.isfinite(a):
+                                allow = max(silence, a)
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
                     yield None
@@ -2007,8 +2506,13 @@ class StrataEngine:
                     except (IndexError, ValueError):
                         pass
                 elif line.startswith("DONE"):
-                    self._parse_done(line)
+                    # A03h r02 (Codex counterexample): DONE is the engine's END marker BEFORE its
+                    # figures are read - r01 set done only after _parse_done, so a corrupt figure sent
+                    # the finally into a STOP+drain waiting for an end the wire had ALREADY delivered:
+                    # EngineSilent over .09s replaced the real parse fault. The marker ends the request;
+                    # the figure fault then surfaces as its own error (StreamCorrupted -> 503).
                     done = True
+                    self._parse_done(line)
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     return
@@ -2039,7 +2543,15 @@ class StrataEngine:
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
-                        self._parse_done(line)
+                        # A03h r02: this drain runs WHILE an error is already on its way out (early
+                        # consumer / STOP): a corrupt end figure must not ALSO replace that fault -
+                        # the end is seen either way (parent: its bare int() could raise right here,
+                        # a pre-existing hole; figures of a lying end leg are read as absent, never
+                        # invented).
+                        try:
+                            self._parse_done(line)
+                        except StreamCorrupted as ex:
+                            print(f"[strata] {ex}", flush=True)
                         break
                     if not self.can_stop:
                         heard = time.monotonic()
@@ -2195,44 +2707,104 @@ class StrataEngine:
                 continue
             raise out_of_step(line)
 
-    def close(self):
-        """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
-        if self.proc is None:
+    def close(self, owner=None):
+        """End the engine process (user intent): a running start of an older generation is voided first.
+        `owner`: a captured process handle - then this call ends nothing unless that process is still the one
+        this engine publishes (an old worker can never end a successor)."""
+        self._reap_finished()
+        with self._own:
+            flying = self._inflight_close
+            if flying is not None and flying.proc.poll() is None:
+                raise EngineStuck("this engine's process is still being ended; retry after it exits")
+            ctx = self._published
+            if ctx is None and flying is None and owner is None and self.proc is not None:
+                # a lazy/manual owner: nothing was published (no start in flight), close what self.proc says
+                ctx = _Start(self.proc, getattr(self, "log", None))
+                ctx.pump = getattr(self, "pump", None)
+            if owner is not None and (ctx is None or ctx.proc is not owner):
+                return                           # superseded owner: touch nothing at all
+            self._intent += 1
+            if ctx is not None:
+                self._published = None           # linearised with the intent bump: exactly one closes it
+                self._inflight_close = ctx
+        if ctx is not None:
+            self._close_proc(ctx)
+
+    def _reap_finished(self):
+        """A context whose close finished (or whose process died) no longer blocks; free its resources."""
+        with self._own:
+            flying = self._inflight_close
+        if flying is not None and flying.proc.poll() is not None:
+            self._close_proc(flying)
+
+    def _close_current(self):
+        """Close the process this engine currently owns (captured context; never a successor's)."""
+        self._reap_finished()
+        with self._own:
+            flying = self._inflight_close
+            if flying is not None and flying.stuck and flying.proc.poll() is None:
+                raise EngineStuck("the previous process could not be ended; it still owns this engine")
+            ctx = self._published
+            if ctx is None and flying is None and self.proc is not None:
+                ctx = _Start(self.proc, getattr(self, "log", None))
+                ctx.pump = getattr(self, "pump", None)
+            if ctx is not None:
+                self._published = None
+                self._inflight_close = ctx
+        if ctx is not None:
+            self._close_proc(ctx)
+
+    def _close_proc(self, ctx):
+        """The old close(), bound to one start context: a successor's process/streams/log are never touched."""
+        proc, pump, log = ctx.proc, ctx.pump, ctx.log
+        if proc is None:
             return
         try:
-            if self.proc.poll() is None:
+            if proc.poll() is None:
                 try:
-                    self.proc.stdin.write("QUIT\n")
-                    self.proc.stdin.flush()
-                    self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
+                    proc.stdin.write("QUIT\n")
+                    proc.stdin.flush()
+                    proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
+                    proc.wait(timeout=20)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
-                    self.proc.terminate()
-                    self.proc.wait(timeout=20)
+                    proc.terminate()
+                    proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
+            proc.kill()
             try:
-                self.proc.wait(timeout=20)
+                proc.wait(timeout=20)
             except subprocess.TimeoutExpired:
+                ctx.stuck = True
+                with self._own:                  # the live process keeps its owner: no lost owner, no new spawn
+                    self._inflight_close = ctx    # tracked even when a successor is published (never overwritten)
+                    if self._published is None:
+                        self._published = ctx
                 raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
         except OSError:
             pass
         finally:
-            if self.proc.poll() is not None:
-                if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
-                    self.pump.join(timeout=2)
+            if proc.poll() is not None:
+                if pump is not None and pump.ident is not None:   # a restart can stop before starting it
+                    pump.join(timeout=2)
                 try:
-                    self.proc.stdin.close()             # buffered data may flush again after the engine has exited
+                    proc.stdin.close()             # buffered data may flush again after the engine has exited
                 except OSError:
                     pass
-                self.proc.stdout.close()
-                if self.log not in (None, subprocess.DEVNULL):
-                    self.log.close()
-                self.proc = None
-                self.ended = True
-                self.progress, self.last = None, {}
-                self.progress_ms, self.reused = 0, 0
+                proc.stdout.close()
+                if log not in (None, subprocess.DEVNULL):
+                    log.close()
+                with self._own:                     # only our own generation is cleared, never a successor's state
+                    if self._inflight_close is ctx:
+                        self._inflight_close = None
+                    if self.proc is proc:
+                        current = self._published
+                        if current is not None and current.proc is not proc:
+                            self.proc, self.pump = current.proc, current.pump   # a discarded start: publish wins
+                        else:
+                            self.proc = None
+                            self.ended = True
+                            self.progress, self.last = None, {}
+                            self.progress_ms, self.reused = 0, 0
 
 
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
@@ -3479,8 +4051,12 @@ class Service:
         try:
             self.engine.restart()
         except Exception:
-            if vision_started:
-                self.vision.unload()
+            if vision_started:                           # the encoder this call started goes down again with the failed start
+                try:
+                    self.vision.unload()
+                except Exception as e:                   # its error must not replace the engine's, which is the one to report
+                    print(f"[strata] the vision encoder could not be stopped after the failed start: {e}", flush=True)
+                self.vision_held = False
             raise
         print("[strata] the engine is running again", flush=True)
         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
@@ -3530,6 +4106,23 @@ class Service:
         log = getattr(self.engine, "log_path", None)
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
+
+    def _ensure_loaded_traced(self, trace) -> None:
+        """ensure_loaded() for a request at its own turn (the caller holds the lock it needs): a start that really happens here (the engine
+        died or was unloaded after this request's load(), e.g. by the request before it) is load time - the record says "loading" while it
+        runs and load_s keeps exactly that section, also when it fails; a call that finds everything running changes nothing."""
+        starting = trace is not None and not (self.loaded() and not self._vision_down())
+        if starting:
+            with self.status_lock:
+                trace["state"] = "loading"
+        t0 = time.perf_counter()
+        try:
+            self.ensure_loaded()
+        finally:
+            if starting:
+                with self.status_lock:
+                    trace["load_s"] += round(time.perf_counter() - t0, 3)
+                    trace["state"] = "generating"
 
     def load(self):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
@@ -3584,14 +4177,20 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
-            if not self.engine.alive():
+            engine_up = self.engine.alive()
+            v = self.vision
+            encoder_up = v is not None and hasattr(v, "unload") and hasattr(v, "alive") and v.alive()
+            if not engine_up and not encoder_up:
                 return "not loaded"
             with self.status_lock:
                 if self.status.get("busy") or self.status.get("queued"):
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
-            self.engine.unload()
+            if engine_up:
+                self.engine.unload()
+            else:                                        # the engine is gone (it died, or an earlier unload stopped half way) but its encoder
+                print("[strata] the engine is not running; stopping its vision encoder", flush=True)   # still holds the GPU
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
@@ -3613,6 +4212,8 @@ class Service:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
+                except Exception as e:                  # noqa: BLE001 - any other failure (an encoder that cannot stop, a kill that failed)
+                    print(f"[strata] idle unload failed ({type(e).__name__}: {e}); tried again at the next turn", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
@@ -3893,11 +4494,11 @@ class Service:
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
         prompts without adding or replacing one."""
-        marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
+        marked, marked_tools, changed, lit = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         plain = ()
         if changed:
-            prompt, plain = unmark_think_literals(prompt, self.literals)
+            prompt, plain = unmark_think_literals(prompt, lit or self.literals)
         if self.prompts is not None:            # #567: only what follows the last special shared with a recent prompt
             return self.prompts.encode(prompt, plain, store)
         return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
@@ -4043,13 +4644,29 @@ class Service:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
-            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
-            self.embeddings.path = combined             # first, so a half-written one is found as well
-            # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
-            # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
-            # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
-            self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
-            write_temporary(combined, [p for p, _ in encoded])
+            try:
+                combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
+                self.embeddings.path = combined         # first, so a half-written one is found as well
+                # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
+                # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
+                # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
+                self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
+                write_temporary(combined, [p for p, _ in encoded])
+            except OSError as e:                        # A04a: a local file error here is the server's, and the answer has not begun
+                # The thread's state goes first and in every case; removing the half-written file is best effort - a
+                # file that cannot be removed (the same full or read-only place) stays, and must not take the 500 with it.
+                path, self.embeddings.path = getattr(self.embeddings, "path", None), None
+                self.embeddings.keys = None
+                left = ""
+                if path is not None:
+                    try:
+                        Path(path).unlink(missing_ok=True)
+                    except OSError as cleanup:
+                        left = f"; the half-written file could not be removed ({type(cleanup).__name__}, errno {cleanup.errno})"
+                print(f"[strata] the images' embeddings file could not be made ({type(e).__name__}, errno {e.errno}){left}: "
+                      "the request is answered 500; no engine was started", flush=True)
+                raise EmbeddingFileError("the server could not prepare the images for the engine (a local file error "
+                                         "on the server); no answer was started, try the request again") from e
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
@@ -4088,7 +4705,7 @@ class Service:
 
         def head_ids(msgs):
             """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when it is there)."""
-            marked, marked_tools, changed = mark_think_literals(msgs, tools, self.literals)
+            marked, marked_tools, changed, lit = mark_think_literals(msgs, tools, self.literals)
             effort = kwargs.get("reasoning_effort")
             off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
@@ -4099,7 +4716,7 @@ class Service:
             if cut >= 0:
                 text = text[:cut]
             if changed:
-                text, plain = unmark_think_literals(text, self.literals)
+                text, plain = unmark_think_literals(text, lit or self.literals)
                 return self.tok.encode(text, parse_special=True, plain=plain)
             return self.tok.encode(text, parse_special=True)
 
@@ -4288,6 +4905,9 @@ class Service:
                     with self.status_lock:
                         self.status["queued"] -= 1
                     raise
+                if got and cancel.is_set():              # the turn came just as its client left: give it to the next one
+                    turn.close()                         # (a native request would otherwise be sent only to be stopped)
+                    got = False
                 if not got:                              # cancelled while queued
                     with self.status_lock:
                         self.status["queued"] -= 1
@@ -4309,10 +4929,18 @@ class Service:
                     # loaded engine has nothing to start, so it does not wait for the fifo at all
                     try:
                         if not par:
-                            self.ensure_loaded()
+                            self._ensure_loaded_traced(trace)
                         elif not (self.loaded() and not self._vision_down()):
+                            waited = time.perf_counter()
+                            if trace is not None:
+                                with self.status_lock:
+                                    trace["state"] = "queued"          # the wait for the control lines is queue time, not load time
                             with self.fifo:
-                                self.ensure_loaded()
+                                if trace is not None:
+                                    with self.status_lock:
+                                        trace["queue_s"] += round(time.perf_counter() - waited, 3)
+                                        trace["state"] = "generating"
+                                self._ensure_loaded_traced(trace)     # whether a start is still needed is asked again under the lock
                     except BaseException:
                         if par:
                             with self.status_lock:
@@ -5059,8 +5687,81 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             yield "message_stop", {"type": "message_stop"}
 
 
+class _CollectBuf:
+    """Bounded fragment buffer for one block field (audit 2026-10-21): fragments accumulate in groups of
+    GROUP; a completed group joins to ONE string (done), so the full accumulated string is never re-joined
+    per delta and no full text exists until joined() is asked for it.  Keeps peak memory at one full copy
+    (a per-delta list keeps every tiny delta object alive; a naive full re-join is quadratic).  Only ever
+    holds STRINGS: a non-string fragment (only reachable from forged events - the emitter always sends str)
+    takes the field out of buffering entirely and back to the old per-delta operator (see _DIRECT)."""
+    __slots__ = ("done", "parts")
+    GROUP = 64
+
+    def __init__(self):
+        self.done, self.parts = [], []
+
+    def add(self, frag: str) -> None:
+        self.parts.append(frag)
+        if len(self.parts) >= self.GROUP:
+            self.done.append("".join(self.parts))
+            self.parts.clear()
+
+    def joined(self) -> str:
+        if self.parts:
+            self.done.append("".join(self.parts))
+            self.parts.clear()
+        return self.done[0] if len(self.done) == 1 else "".join(self.done)
+
+
+# Field state after an anomalous (non-string) fragment or non-string initial value: the field left buffering
+# and every following fragment applies the OLD operator at its own delta - `+=` for text/thinking, `+` for
+# _json (the old `b["_json"] = b.get("_json", "") + frag` built a NEW object: a shared list/dict initial from
+# a forged event was never mutated in place, and error position/precedence over a dying event source stayed
+# exact (Codex review 2026-10-21, collector-review-614810cf: deferred generic flush broke both).
+_DIRECT = object()
+
+
+def _direct_apply(b: dict, fld: str, frag) -> None:
+    if fld == "_json":
+        b[fld] = b.get(fld, "") + frag          # the old JSON line: +, new object, never mutates the initial
+    else:
+        b[fld] += frag                          # the old text/thinking line: __iadd__ on the block value
+
+
+def _probe_iadd(init, frag):
+    """Evaluate `init += frag` on a COPY - the type error the old collector's first `b[fld] += frag`
+    raised AT THAT DELTA (forged non-string block content; the emitter always sends str).  A mutable
+    initial is extended on the throwaway copy, never on the block."""
+    acc = copy.copy(init)
+    acc += frag
+    return acc
+
+
+def _flush_collect(b: dict, group: dict) -> None:
+    """Materialize one block's buffered fields into the block dict.  _DIRECT fields were already applied at
+    their deltas; buffered values are a lone string fragment (one delta - the common small case, no buffer
+    object) or a _CollectBuf of strings.  += mirrors the old collector's __iadd__ for text/thinking; _json
+    rebuilds with + exactly like the old `b["_json"] = b.get("_json", "") + ...` - including the block whose
+    content_block_stop never came, which kept its raw _json in the response."""
+    for fld, held in group.items():
+        if held is _DIRECT:
+            continue
+        if fld == "_json":
+            joined = held.joined() if isinstance(held, _CollectBuf) else held
+            b[fld] = b.get(fld, "") + joined
+        else:
+            b[fld] += held.joined() if isinstance(held, _CollectBuf) else held
+    group.clear()
+
+
 def anthropic_collect(events) -> dict:
-    msg, blocks = None, []
+    """A non-streaming Anthropic message: the streamed events folded into the final message dict.
+    text / thinking / partial tool-JSON arrive in grouped buffers (_CollectBuf from the 2nd fragment on)
+    instead of one += per delta (262K chars in 8-char deltas: 136 ms -> 3.7 ms, one full copy of the text
+    either way); the returned blocks, their order and every field are exactly what per-delta concatenation
+    built - including the KeyError/TypeError a delta against a block that carries no such field raises at
+    that delta, the no-input call that loses its block (#211), and a block whose content_block_stop never came."""
+    msg, blocks, bufs = None, [], []
     for item in events:
         if item is None:                           # a heartbeat
             continue
@@ -5069,24 +5770,58 @@ def anthropic_collect(events) -> dict:
             msg = e["message"]
         elif name == "content_block_start":
             blocks.append(dict(e["content_block"]))
+            bufs.append({})
         elif name == "content_block_delta":
-            d, b = e["delta"], blocks[-1]
+            d, b, group = e["delta"], blocks[-1], bufs[-1]
             if d["type"] == "text_delta":
-                b["text"] += d["text"]
+                fld, frag = "text", d["text"]
             elif d["type"] == "thinking_delta":
-                b["thinking"] += d["thinking"]
+                fld, frag = "thinking", d["thinking"]
             else:                                  # input_json_delta pieces: parsed when complete
-                b["_json"] = b.get("_json", "") + d["partial_json"]
-        elif name == "content_block_stop" and blocks and "_json" in blocks[-1]:
-            b = blocks[-1]
-            try:
-                b["input"] = json.loads(b.pop("_json") or "{}")
-            except ValueError:                     # a call the output ended inside (#211): it has no input to give
-                blocks.pop()
+                fld, frag = "_json", d["partial_json"]
+            held = group.get(fld, None)
+            if fld not in group:
+                if fld == "_json":
+                    if isinstance(frag, str) and isinstance(b.get(fld, ""), str):
+                        group[fld] = frag          # both sides strings: buffer (one fragment, no object)
+                    else:                          # the old + line would fail or rebuild HERE - so it does
+                        group[fld] = _DIRECT
+                        _direct_apply(b, fld, frag)
+                elif isinstance(frag, str):
+                    _probe_iadd(b[fld], frag)      # the old first `b[fld] += frag` ran HERE: same KeyError/
+                    group[fld] = frag              #  TypeError, same delta, same position in the stream
+                else:                              # a NON-string first fragment on an initial that tolerates
+                    group[fld] = _DIRECT           #  `+= int/bytes` (list, int): it must leave buffering at
+                    _direct_apply(b, fld, frag)    #  once too (Claude review 2026-10-21: only _json checked)
+            elif held is _DIRECT:                  # anomalous field: the old operator at every delta
+                _direct_apply(b, fld, frag)
+            elif not isinstance(frag, str):        # held is a string or a buffer of strings now, never odd
+                pending = held.done + held.parts if isinstance(held, _CollectBuf) else (held,)
+                for one in pending:                # buffered pieces first, in delta order...
+                    _direct_apply(b, fld, one)
+                group[fld] = _DIRECT
+                _direct_apply(b, fld, frag)        # ...then THIS fragment at its own delta, and all after
+            elif isinstance(held, _CollectBuf):
+                held.add(frag)
+            else:                                  # the second string fragment promotes to the grouped buffer
+                buf = group[fld] = _CollectBuf()
+                buf.add(held)
+                buf.add(frag)
+        elif name == "content_block_stop" and blocks and (blocks[-1] or bufs[-1]):
+            b, group = blocks[-1], bufs[-1]
+            _flush_collect(b, group)               # materialize this block's fields, then the old #211 rule
+            if "_json" in b:
+                try:
+                    b["input"] = json.loads(b.pop("_json") or "{}")
+                except ValueError:                 # a call the output ended inside (#211): it has no input to give
+                    blocks.pop()
+                    bufs.pop()
         elif name == "message_delta":
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
+    for b, group in zip(blocks, bufs):             # a block whose content_block_stop never came keeps its fields
+        _flush_collect(b, group)                   # as plain text, exactly like the old += had left them
     msg["content"] = blocks
     return msg
 
@@ -5104,6 +5839,16 @@ def body_limit() -> int:
     except ValueError:
         mib = 0
     return mib << 20 if mib > 0 else CHUNKED_BODY_MAX
+
+
+def cap_tokens(value, field: str) -> int:
+    """A request's reply cap as a whole number (0/-1: the rest of the context; a float or a numeric string is cut as before).
+    A JSON number such as 1e309 reads as infinity, which has no whole number: a 400 that names the field, not an
+    OverflowError that closes the connection before any answer."""
+    try:
+        return int(value)
+    except OverflowError:
+        raise ValueError(f"{field} must be a finite number") from None
 
 
 class BadBody(Exception):
@@ -5653,6 +6398,10 @@ def make_handler(svc: Service):
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
                            else {"error": {"type": "server_error", "message": str(e)}})
+            except StreamCorrupted as e:                    # A03f: corrupt engine wire, never a client fault:
+                print(f"[strata] 503: {e}", flush=True)     #  the parse must not land in the 400 handlers
+                self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
+                           else {"error": {"type": "server_error", "message": str(e)}})
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
@@ -5684,6 +6433,11 @@ def make_handler(svc: Service):
             except EngineStuck as e:                         # an unload or restart that could not end the engine
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
+            except EmbeddingFileError as e:                  # A04a: the server's own file error, before the answer began
+                if getattr(self, "answer_started", False):
+                    raise
+                self._json(500, responses_error_body(str(e), "server_error", code="server_error") if path == "/v1/responses"
+                           else {"error": {"type": "server_error", "message": str(e)}})
             except ClientGone:                               # #1999: the client left while the request was prepared
                 self._note(outcome="disconnected")
             except OSError:
@@ -5917,6 +6671,9 @@ def make_handler(svc: Service):
                         with svc.status_lock:
                             for name, value in (("output", content), ("reasoning", reasoning)):
                                 if value:
+                                    if self.record[name + "_truncated"] and isinstance(value, str) \
+                                            and len(self.record[name]) >= 262144:
+                                        continue          # the kept prefix cannot change any more: no copy of it
                                     combined = self.record[name] + value
                                     self.record[name] = combined[:262144]
                                     self.record[name + "_truncated"] |= len(combined) > 262144
@@ -5940,7 +6697,8 @@ def make_handler(svc: Service):
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
-            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            max_req = max_new = cap_tokens(req.get("max_completion_tokens") or req.get("max_tokens") or 0,
+                                           "max_completion_tokens" if req.get("max_completion_tokens") else "max_tokens")   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
@@ -6058,8 +6816,14 @@ def make_handler(svc: Service):
                                                                 code="server_error"))
                 except EngineNonFinite as e:                 # #879, twice: not the request's fault
                     return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                except StreamCorrupted as e:                 # A03f: the engine's wire broke grammar: the same 503
+                    return self._json(503, responses_error_body(str(e), "server_error",  #  family as a dead engine,
+                                                                code="server_error"))   #  never the client's fault
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                if result is None:                           # the client hung up and the turn was cancelled: no answer to send
+                    self._note(outcome="disconnected")
+                    return
                 return self._json(200, result)
             self._sse()
             last = time.monotonic()
@@ -6179,7 +6943,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            max_new = cap_tokens(req.get("max_tokens") or 0, "max_tokens")   # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type

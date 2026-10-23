@@ -206,7 +206,8 @@ def validated_json(text, validator, finish):
     try:
         value = json.loads(_extract_json(text), object_pairs_hook=pairs, parse_constant=constant)
         canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-    except (ValueError, TypeError) as exc:
+        canonical.encode("utf-8")      # a lone surrogate (the escape \\ud800) is valid JSON but cannot be sent: UnicodeEncodeError
+    except (ValueError, TypeError, RecursionError) as exc:      # RecursionError: an answer nested deeper than the decoder allows
         raise StructuredOutputError(f"model did not return valid JSON: {exc}") from exc
     try:
         error = next(validator.iter_errors(value), None)

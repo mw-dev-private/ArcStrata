@@ -177,19 +177,40 @@ def _image_source(part: dict) -> str:
     return url or ""
 
 
+def _join_text_run(run: list[str]) -> str:
+    """The text of one run of adjacent text parts: each part is copied once, however many there are."""
+    return run[0] if len(run) == 1 else "".join(run)
+
+
 def _parts_of(content):
     """Message content for the template: a string when there is no image (unchanged behaviour), otherwise the
-    template's list form - text items and image items, in order - whose image items carry their source."""
+    template's list form - text items and image items, in order - whose image items carry their source.  Adjacent text
+    parts become ONE text item (the template writes them one after the other with nothing between, so the prompt is the
+    same), which lets the marking of literal tags and control-token texts see a text that was cut across parts; a run is
+    joined once, not grown part by part.  An image ends a run; a text that is not a string stays the part it was."""
     if not _has_image(content):
         return _text_of(content)
-    items = []
+    items: list[dict] = []
+    run: list[str] = []
+
+    def flush():
+        if run:
+            items.append({"type": "text", "text": _join_text_run(run)})
+            run.clear()
     for part in content:
         if not isinstance(part, dict):
             continue
         if part.get("type") in IMAGE_PARTS:
+            flush()
             items.append({"type": "image", "source": _image_source(part)})
         elif part.get("type") in TEXT_PARTS and "text" in part:
-            items.append({"type": "text", "text": part.get("text", "")})
+            text = part.get("text", "")
+            if isinstance(text, str):
+                run.append(text)
+            else:                       # not text: kept as it was, between the runs
+                flush()
+                items.append({"type": "text", "text": text})
+    flush()
     return items
 
 
@@ -271,11 +292,73 @@ def _mark(text: str, tags: dict[str, str] = LITERAL_TAGS) -> str:
     return text
 
 
+# The marks themselves are private-use codepoints (above).  A user's ORIGINAL text may already contain one:
+# U+F0E01 in a message is valid Unicode, and on the unmarked fast path it survives as ordinary text.  But once a
+# quoted literal puts the request on the marking path, unmark_think_literals rewrites EVERY mark it finds -
+# including the user's own character - into the tag text (measured 2026-10-20: "Keep \U000F0E01 unchanged" became
+# "Keep <think> unchanged").  Fix: when the marking path is taken, the marks that collide with characters already
+# present in this request are relocated to fresh private-use codepoints, so original text is never rewritten.
+# Relocation allocates only on a collision (a scan of the PUA ranges over the request, on a path that is already
+# rebuilding containers); without one, every mark, id and span is exactly as before.  The scan covers dictionary
+# KEYS as well as values: the template serializes tool schemas, so a PUA character in a schema key lands in the
+# prompt just like one in a value (Codex review 2026-10-21, R1), and a candidate mark that occurs in a key must
+# not be allocated either.  finditer, not findall: an occurrence list of every hit (7 MB for 100K repeats of one
+# character) is exactly what this efficiency package must not add (R2).
+_PUA_RE = re.compile("[\uE000-\uF8FF\U000F0000-\U0010FFFF]")    # BMP + planes 15/16 private-use
+
+
+def _observed_pua(v, found: set) -> None:
+    """Every private-use character present in `v`'s strings AND string keys (the characters a mark must not
+    impersonate or collide with).  Lazy finditer: memory tracks the DISTINCT characters, never the occurrences."""
+    if isinstance(v, str):
+        found.update(m[0] for m in _PUA_RE.finditer(v))
+    elif isinstance(v, dict):
+        for k, x in v.items():
+            if isinstance(k, str):
+                found.update(m[0] for m in _PUA_RE.finditer(k))
+            _observed_pua(x, found)
+    elif isinstance(v, list):
+        for x in v:
+            _observed_pua(x, found)
+
+
+# Candidate pools for relocated marks, tried in order: BMP private-use first (cheapest UTF-8, never used by our
+# marks), then plane 15 above today's marks, then plane 16.  Refusal is only at ~137K DISTINCT observed PUA
+# characters in one request (pool 6400 + 65536 + 65536) - not at 61,934 as suffix-only allocation refused, and
+# never while any pool has an unobserved character left (Codex review 2026-10-21, R4).
+_PUA_POOLS = ((0xE000, 0xF8FF), (0xF0E00, 0xFFFFF), (0x100000, 0x10FFFF))
+
+
+def _collision_free_tags(tags: dict[str, str], observed: set) -> dict[str, str]:
+    """`tags` with every mark that appears in the request's OWN text (values or keys) replaced by a fresh,
+    unobserved private-use codepoint.  Same tags, same order - only values move, and only for colliding tags."""
+    reserved = set(tags.values())
+    clashes = [t for t, m in tags.items() if m in observed]
+    if not clashes:
+        return tags
+    out, taken = dict(tags), reserved | observed
+    cursors = {lo: lo for lo, _ in _PUA_POOLS}
+    for tag in clashes:
+        mark = None
+        for lo, hi in _PUA_POOLS:
+            nxt = cursors[lo]
+            while nxt <= hi and chr(nxt) in taken:
+                nxt += 1
+            if nxt <= hi:
+                mark, cursors[lo] = chr(nxt), nxt + 1
+                break
+        if mark is None:
+            raise ValueError("every private-use marker candidate already appears in this request's text; "
+                             "refusing to rewrite it")
+        out[tag], taken = mark, taken | {mark}
+    return out
+
+
 def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
     if isinstance(v, str):
         return _mark(v, tags)
-    if isinstance(v, dict):
-        return {k: _mark_deep(x, tags) for k, x in v.items()}
+    if isinstance(v, dict):         # keys too: a tool schema's property names and a call's argument names reach the prompt
+        return {(_mark(k, tags) if isinstance(k, str) else k): _mark_deep(x, tags) for k, x in v.items()}
     if isinstance(v, list):
         return [_mark_deep(x, tags) for x in v]
     return v
@@ -285,7 +368,7 @@ def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     if isinstance(v, str):
         return any(tag in v for tag in tags)
     if isinstance(v, dict):
-        return any(_has_tag(x, tags) for x in v.values())
+        return any(_has_tag(k, tags) or _has_tag(x, tags) for k, x in v.items())
     if isinstance(v, list):
         return any(_has_tag(x, tags) for x in v)
     return False
@@ -334,20 +417,28 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
     LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
     whether there was one (None: no change, the same objects back - a prompt without them renders as it always did).
     An assistant message whose content opens with a whole <think>...</think> block (clients that send the reasoning
-    inline) keeps that one block as the model's markers, as before."""
+    inline) keeps that one block as the model's markers, as before.
+    The 4th element is the tag map the marks were taken from when that differs from `tags` (a request whose own text
+    carries a mark character: _collision_free_tags relocated it) - pass it to unmark_think_literals in that case;
+    None means `tags` unchanged."""
     if not _has_tag(messages, tags) and not _has_tag(tools, tags):
-        return messages, tools, False
+        return messages, tools, False, None
+    observed: set = set()
+    _observed_pua(messages, observed)
+    if tools is not None:
+        _observed_pua(tools, observed)
+    effective = _collision_free_tags(tags, observed) if observed & set(tags.values()) else tags
     out = []
-    own = {t: v for t, v in tags.items() if t not in TOOL_LITERAL_TAGS}     # what an assistant message keeps as written
+    own = {t: v for t, v in effective.items() if t not in TOOL_LITERAL_TAGS}     # what an assistant message keeps as written
     for m in messages:
         m = dict(m)
         content = m.get("content")
-        mine = own if m.get("role") == "assistant" else tags
+        mine = own if m.get("role") == "assistant" else effective
         for k, v in m.items():
             if k != "role":
                 m[k] = _mark_deep(v, mine)
         if m.get("role") == "user":
-            kept = _keep_tool_result_wrap(content, tags)
+            kept = _keep_tool_result_wrap(content, effective)
             if kept is not None:
                 m["content"] = kept
         if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
@@ -356,16 +447,58 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
             m["content"] = (content[:i] + _mark(content[i:j], own) + "</think>" +
                             _mark(content[j + len("</think>"):], own))
         out.append(m)
-    return out, _mark_deep(tools, tags), True
+    return out, _mark_deep(tools, effective), True, (effective if effective is not tags else None)
 
 
 _THINK_MARK_RE = re.compile("|".join(THINK_MARKS))
 
 
+_UNMARK_SPARSE_MAX = 4096       # allocation of the (pos, mark) list stays bounded (~0.3 MB); beyond this the
+                                # dense prompt takes the proven regex path instead (Codex review 2026-10-21:
+                                # a 20K-marker text cost 6.4 vs 4.3 MB traced peak unfound - tradeoff closed)
+
+
+def _sparse_mark_hits(prompt: str, marks: dict) -> list | None:
+    """Every (pos, mark) hit for these single-character marks, sorted; None when there are more than
+    _UNMARK_SPARSE_MAX of them (the abort bounds the list - the caller then uses the regex path)."""
+    found = []
+    for mark in marks:
+        at = prompt.find(mark)
+        while at >= 0:
+            found.append((at, mark))
+            if len(found) > _UNMARK_SPARSE_MAX:
+                return None
+            at = prompt.find(mark, at + 1)
+    found.sort()
+    return found
+
+
 def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> tuple[str, list[tuple[int, int]]]:
     """The rendered prompt with THINK_TAGS' marks turned back into the tags' text, and the (start, end) spans of those
-    tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans)."""
+    tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans).
+    Every mark literal_tags() builds is ONE character, and in a real prompt they are rare (one per quoted literal in
+    a 400K-character prompt): scanning each mark with str.find and rebuilding only on a hit is far faster than the
+    alternation regex (audit 2026-10-21, real 33-marker map: 9.89 ms -> 0.50 ms on the fixture), and a prompt without
+    a single mark comes back unchanged - no list of pieces, no join, no copy.  Marker-dense prompts (> 4096 marks)
+    fall back to the regex: same proven behavior, bounded extra memory.  A tags' map carrying a multi-character mark
+    (not the shipped form) keeps the old regex path too."""
     marks = THINK_MARKS if tags is LITERAL_TAGS else {v: k for k, v in tags.items()}
+    if all(len(m) == 1 for m in marks):
+        hits = _sparse_mark_hits(prompt, marks)
+        if hits is not None:
+            if not hits:
+                return prompt, []
+            out, spans, pos, n = [], [], 0, 0
+            for at, mark in hits:
+                out.append(prompt[pos:at])
+                n += at - pos
+                tag = marks[mark]
+                out.append(tag)
+                spans.append((n, n + len(tag)))
+                n += len(tag)
+                pos = at + 1
+            out.append(prompt[pos:])
+            return "".join(out), spans
     mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else re.compile("|".join(map(re.escape, marks)))
     out, spans, pos, n = [], [], 0, 0
     for m in mark_re.finditer(prompt):
@@ -518,6 +651,77 @@ def tool_arguments(raw) -> dict:
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
 
 
+# What the call format writes around a name - `<function=NAME>` and `<parameter=KEY>` - and reads back by its ">" and its
+# lines, so a name carrying one of these cannot be told from the tags and arguments around it (audit 2026-10-21, A02).
+_NAME_DELIMITERS = (("<", "a '<'"), (">", "a '>'"), ("\n", "a line break"), ("\r", "a line break"), ("\x00", "a NUL"))
+
+
+def _name_delimiter(name: str) -> str | None:
+    for ch, label in _NAME_DELIMITERS:
+        if ch in name:
+            return label
+    return None
+
+
+def history_call_problem(name, arguments) -> tuple[str, str] | None:
+    """(field, why) when a call from a client's history cannot be written as `<function=NAME>` with `<parameter=KEY>`
+    inside: no name, a name that is not text, empty or only whitespace, or a function or parameter name that holds a
+    character the format uses as a delimiter (`<`, `>`, a line break, NUL).  The field is "name" or "arguments".  The
+    template writes both verbatim, and the parser takes everything up to the next ">" as the name, so such a call
+    came back as other calls and arguments than the client sent.  Names are otherwise free (parameter keys are JSON
+    strings, tool names may carry dots, colons, spaces, non-ASCII); nothing is rewritten or dropped.  None: fine."""
+    if name is None:
+        return "name", "is missing"
+    if not isinstance(name, str):
+        return "name", f"must be a string, not {type(name).__name__}"
+    if not name.strip():
+        return "name", "is empty"
+    bad = _name_delimiter(name)
+    if bad:
+        return "name", f"contains {bad}, which the call format uses as a delimiter"
+    for key in arguments if isinstance(arguments, dict) else ():
+        bad = _name_delimiter(key) if isinstance(key, str) else None
+        if bad:
+            return "arguments", f"has the parameter name {key[:40]!r}, which contains {bad} (a delimiter of the call format)"
+    return None
+
+
+def order_tool_results(messages: list[dict], exact: bool = False) -> None:
+    """The template places tool results by position: each run of tool messages is put in the order of the calls of the
+    assistant turn before it (a client may send the results in the order they finished), then the private call ids
+    (`_call_id`, on the calls and on the tool messages) are dropped.
+    `exact=False` (the Responses route): every result is ranked by its call's position, unknown or missing ids last, ties
+    in the order sent.  `exact=True` (chat and messages): a run is reordered only when it is exactly the answer to that
+    assistant turn - as many results as calls, every id a non-empty string, no id twice, every result id one of the calls'
+    ids; anything else (a missing, repeated or unknown id, a partial group) stays in the order sent, as before."""
+    i = 0
+    while i < len(messages):
+        if messages[i]["role"] != "tool":
+            i += 1
+            continue
+        j = i
+        while j < len(messages) and messages[j]["role"] == "tool":
+            j += 1
+        prev = messages[i - 1] if i else {}
+        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
+        run = messages[i:j]
+        if exact:
+            ids = [m.get("_call_id") for m in run]
+            ok = (len(order) == len(run) and all(isinstance(x, str) and x for x in order) and all(isinstance(x, str) and x for x in ids)
+                  and len(set(order)) == len(order) and set(ids) == set(order))
+            if ok:
+                rank = {cid: k for k, cid in enumerate(order)}
+                messages[i:j] = sorted(run, key=lambda m: rank[m["_call_id"]])
+        else:
+            rank = {cid: k for k, cid in enumerate(order) if cid}
+            messages[i:j] = sorted(run, key=lambda m: rank.get(m.get("_call_id"), len(order)))
+        i = j
+    for m in messages:
+        m.pop("_call_id", None)
+        for c in m.get("tool_calls") or []:
+            c.pop("_call_id", None)
+
+
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
@@ -534,13 +738,21 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             out["reasoning_content"] = m["reasoning_content"]
         if m.get("tool_calls"):
             calls = []
-            for c in _object_list(m["tool_calls"], "tool_calls"):
+            for k, c in enumerate(_object_list(m["tool_calls"], "tool_calls")):
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
-                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))}})
+                args = tool_arguments(fn.get("arguments"))
+                problem = history_call_problem(fn.get("name"), args)
+                if problem:
+                    raise ValueError(f"messages[{i}].tool_calls[{k}]{'.function' if 'function' in c else ''}."
+                                     f"{problem[0]} {problem[1]}")
+                calls.append({"function": {"name": fn.get("name"), "arguments": args}, "_call_id": c.get("id")})
             out["tool_calls"] = calls
+        if role == "tool":
+            out["_call_id"] = m.get("tool_call_id")
         messages.append(out)
+    order_tool_results(messages, exact=True)       # results sent in another order than their calls are put back (the ids are used here and dropped)
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
     kwargs = {}
@@ -560,6 +772,14 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
 
 BILLING_HEADER = "x-anthropic-billing-header:"
 
+# The cch rewrite ends at most at char 180 (field start <= 160, value <= 16), the cc_version rewrite at most at
+# char 235 (start <= 160, "cc_version=" is 11, value <= 64), and both conditions only ever see semicolons at or
+# before those ends: everything pin_billing_stamp reads and changes lies inside its first _BILLING_LIMIT chars.
+# A ';' that only the unbounded search would find (char 256 or later) can never satisfy end - v <= 16 / <= 64
+# (v <= 171), so the bounded searches decide exactly like the old full-string ones.  Differential-tested against
+# the previous implementation over 1000 random boundary cases (results_billing.json).
+_BILLING_LIMIT = 256
+
 
 def pin_billing_stamp(system: str) -> str:
     """Claude Code starts its system prompt with `x-anthropic-billing-header: cc_version=2.1.170.bf4;
@@ -567,24 +787,30 @@ def pin_billing_stamp(system: str) -> str:
     the prompt changed ~22K tokens in (after the tool list) on every turn and the conversation cache could only reuse
     up to its last 16K checkpoint: half of every agent prompt was read again.  Both stamps are pinned to f's, as
     llama.cpp does (ggml-org/llama.cpp#21793); only a header at the very start of the system text is touched, and
-    only inside its first 160 characters."""
+    only inside its first 160 characters.  Only the header's first _BILLING_LIMIT characters are scanned and copied:
+    an unmodified long system prompt comes back as the same object (audit 2026-10-20: the old list(system) copy cost
+    ~4 ms and ~8 MB on a 1 MB system text)."""
     if not system.startswith(BILLING_HEADER):
         return system
-    s = list(system)
-    cch = system.find("cch=", len(BILLING_HEADER))
+    head = system[:_BILLING_LIMIT]
+    s = list(head)
+    changed = False
+    cch = head.find("cch=", len(BILLING_HEADER))
     if 0 <= cch <= 160:
-        v, end = cch + 4, system.find(";", cch + 4)
+        v, end = cch + 4, head.find(";", cch + 4)
         if end > v and end - v <= 16:
             s[v:end] = "f" * (end - v)
-    cv = system.find("cc_version=")
+            changed = True
+    cv = head.find("cc_version=")
     if 0 <= cv <= 160:
-        v, end = cv + len("cc_version="), system.find(";", cv)
+        v, end = cv + len("cc_version="), head.find(";", cv)
         if v < end and end - v <= 64:
-            parts = system[v:end].split(".")
+            parts = head[v:end].split(".")
             if len(parts) > 3:
                 tail = v + len(".".join(parts[:3])) + 1
                 s[tail:end] = "f" * (end - tail)
-    return "".join(s)
+                changed = True
+    return "".join(s) + system[_BILLING_LIMIT:] if changed else system
 
 
 def anthropic_to_messages(req: dict, think_unasked: bool = True, honor_budget: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
@@ -616,12 +842,18 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True, honor_budget: b
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
+                args = tool_arguments(block.get("input"))
+                problem = history_call_problem(block.get("name"), args)
+                if problem:
+                    raise ValueError(f"messages[{i}].content[{j}].{'input' if problem[0] == 'arguments' else 'name'} "
+                                     f"{problem[1]}")
+                calls.append({"function": {"name": block.get("name"), "arguments": args}, "_call_id": block.get("id")})
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.
                 messages.append({"role": "tool", "content": _parts_of(_check_parts(
-                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS))})
+                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS)),
+                    "_call_id": block.get("tool_use_id")})
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
@@ -630,6 +862,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True, honor_budget: b
             if calls:
                 out["tool_calls"] = calls
             messages.append(out)
+    order_tool_results(messages, exact=True)       # results sent in another order than their calls are put back (the ids are used here and dropped)
     tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
              for t in _tool_list(req.get("tools"), None)] or None
     kwargs = {}
@@ -682,57 +915,146 @@ CALL_END = "</tool_call>"
 PARAM_END = "</parameter>"
 FUNC_START = "<function="
 FUNC_END = "</function>"
+# v0.2.2's wrapped opener recovery, restricted to declared names and one tag line.
+_LOOSE_OPEN = re.compile(r"<[ \t]{0,16}(?:function[ \t]{0,16}[=:][ \t]{0,16}|=[ \t]{0,16})?([A-Za-z0-9_.\-]+)[ \t]{0,16}>")
+_LOOSE_PART = re.compile(r"<[ \t]{0,16}(?:function[ \t]{0,16}[=:][ \t]{0,16}|=[ \t]{0,16})?([A-Za-z0-9_.\-]*)[ \t]{0,16}$")
 
 
-def param_end(text: str, final: bool = False) -> int:
+_WS_RUN = re.compile(r"\s*")
+_PARAM_TOKENS = re.compile(r"<parameter=|</parameter>")
+
+
+def _follows(text: str, j: int) -> str:
+    """What stands at `j` (just after a `</parameter>` and its whitespace): "end" (the next `<parameter=` or
+    `</function>`), "wait" (nothing yet, or only the start of one of them) or "text"."""
+    if text.startswith((PARAM_START, FUNC_END), j):
+        return "end"
+    rest = len(text) - j
+    if rest == 0:
+        return "wait"
+    if rest <= max(len(PARAM_START), len(FUNC_END)) and (PARAM_START.startswith(text[j:]) or FUNC_END.startswith(text[j:])):
+        return "wait"
+    return "text"
+
+
+def param_depth(text: str, depth: int = 0) -> int:
+    """How many `<parameter=` openers inside a value are still unclosed after `text` (which holds no candidate end):
+    each opener opens one, each `</parameter>` closes one if any is open.  The streaming scanner carries this over
+    the part of a value it has already handed out."""
+    for m in _PARAM_TOKENS.finditer(text):
+        if m.group() == PARAM_START:
+            depth += 1
+        elif depth > 0:
+            depth -= 1
+    return depth
+
+
+def _find(text: str, sub: str, start: int = 0) -> int:
+    return text.find(sub, start)
+
+
+def _count(text: str, sub: str, start: int, end: int) -> int:
+    return text.count(sub, start, end)
+
+
+def _prefix_of(tag: str, text: str, j: int) -> bool:
+    """Whether `text[j:]` is empty or the beginning of `tag` (a tag still arriving), without copying the rest of the text."""
+    return len(text) - j <= len(tag) and tag.startswith(text[j:])
+
+
+def param_end(text: str, final: bool = False, settle: bool = False, depth: int = 0, state: list | None = None) -> int:
     """Where a parameter value in `text` ends: the first `</parameter>` followed (after whitespace) by the next
     `<parameter=` or `</function>` - the same text inside a value (a file that documents the call format, #210) is
-    part of the value.  -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
-    at = text.find(PARAM_END)
+    part of the value.  A value may also contain whole `<parameter=...>...</parameter>` examples (a file that
+    documents the format, with or without its `<function=>` / `<tool_call>` around them): a `</parameter>` that
+    closes a `<parameter=` opened inside the value is part of the value, however it is followed.  `depth` is the
+    number of such openers already open before `text` (the part of the value that was handed out already).
+    -1: none yet; -2: undecided - a candidate whose follower has not arrived (`final` accepts it), or one that
+    only a later end can settle: the old rule's first candidate stood inside an unclosed example and no end
+    outside one has come (yet).  `settle` (the turn is over) takes that first candidate then, which is where the
+    value ended before examples were told apart - an unclosed `<parameter=NAME>` mention keeps ending its value
+    at the first `</parameter>` that is followed by the next parameter.  `final` implies `settle`.  Where no
+    `<parameter=` stands inside the value this is the plain rule.
+    `state` ([scanned, depth, first, searched], mutated) lets a caller that asks again about the same, longer text -
+    the streaming scanner, once per feed - go on where the last call stopped instead of scanning the value afresh:
+    past the closers already weighed (`scanned`, with the nesting `depth` and the old rule's `first` candidate then)
+    and past the text already searched for the next one (`searched`).  It holds for as long as the text up to
+    `searched` is unchanged; `depth` is then ignored."""
+    return _param_end_at(text, 0, final, settle, depth, state)
+
+
+def _param_end_at(text: str, start: int, final: bool = False, settle: bool = False, depth: int = 0,
+                  state: list | None = None) -> int:
+    """param_end for the value that begins at `start` in `text`: the same rule, the index returned is absolute, and the
+    text before `start` is not copied (a long call body is walked parameter by parameter)."""
+    first = -1
+    scanned = searched = start
+    if state is not None:
+        scanned, depth, first, searched = state
+    at = _find(text, PARAM_END, max(scanned, searched))
     while at >= 0:
-        after = text[at + len(PARAM_END):].lstrip()
-        if after.startswith(("<parameter=", FUNC_END)):
-            return at
-        if not after or "<parameter=".startswith(after) or FUNC_END.startswith(after):
-            return at if final else -2
-        at = text.find(PARAM_END, at + 1)
+        here = depth + _count(text, PARAM_START, scanned, at)
+        after = at + len(PARAM_END)
+        follows = _follows(text, _WS_RUN.match(text, after).end())
+        if follows == "wait" and not final:
+            return -2                       # not consumed: asked again when the follower has arrived
+        if follows != "text":
+            if here == 0:
+                return at
+            if first < 0:
+                first = at
+        depth, scanned = (here - 1 if here > 0 else 0), after
+        if state is not None:
+            state[:] = [scanned, depth, first, scanned]
+        at = _find(text, PARAM_END, scanned)
+    if state is not None:
+        state[3] = max(scanned, len(text) - len(PARAM_END) + 1)       # no closer up to here: do not search it again
+    if first >= 0:
+        return first if (settle or final) else -2
     return -1
 
 
-def call_end(text: str) -> int:
+def call_end(text: str, settle: bool = False, state: dict | None = None) -> int:
     """Where a tool call's body ends (#210): the `</tool_call>` after the call's own `</function>`, found by walking
     its parameters with param_end, so a value may contain either tag.  -1: not complete yet.  A body that is not in
-    the call format ends at the first `</tool_call>`, as before."""
-    s = text.lstrip()
-    pos = len(text) - len(s)
-    if not s.startswith("<function="):
-        return text.find(CALL_END) if not "<function=".startswith(s) else -1
-    gt = text.find(">", pos)
-    if gt < 0:
-        return -1
-    pos = gt + 1
+    the call format ends at the first `</tool_call>`, as before.  `state` (a dict a caller keeps for one growing
+    body, the stream parser once per feed) lets the walk go on where the last call stopped: the parameters already
+    ended are not walked again and the value in progress goes on with param_end's own state, for as long as the text
+    up to there is unchanged - the work of a call stays with its new text however often a value shows a tag."""
+    st = state if state is not None else {}
+    pos = st.get("pos")
+    if pos is None:
+        j = _WS_RUN.match(text, 0).end()
+        if not text.startswith(FUNC_START, j):
+            return _find(text, CALL_END) if not _prefix_of(FUNC_START, text, j) else -1
+        gt = _find(text, ">", j)
+        if gt < 0:
+            return -1
+        pos = st["pos"] = gt + 1
     while True:
-        rest = text[pos:]
-        s = rest.lstrip()
-        pos += len(rest) - len(s)
-        if s.startswith("<parameter="):
-            gt = text.find(">", pos)
+        j = _WS_RUN.match(text, pos).end()
+        if text.startswith(PARAM_START, j):
+            gt = _find(text, ">", j)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:])
+            pe = st.get("pe")
+            if pe is None or st.get("vs") != gt + 1:
+                pe, st["vs"] = [gt + 1, 0, -1, gt + 1], gt + 1
+                st["pe"] = pe
+            end = _param_end_at(text, gt + 1, settle=settle, state=pe)
             if end < 0:
                 return -1
-            pos = gt + 1 + end + len(PARAM_END)
-        elif s.startswith(FUNC_END):
-            rest = text[pos + len(FUNC_END):]
-            s = rest.lstrip()
-            if s.startswith(CALL_END):
-                return pos + len(FUNC_END) + len(rest) - len(s)
-            return -1 if CALL_END.startswith(s) else text.find(CALL_END, pos)
-        elif not s or "<parameter=".startswith(s) or FUNC_END.startswith(s):
+            pos = st["pos"] = end + len(PARAM_END)
+            st["pe"] = st["vs"] = None
+        elif text.startswith(FUNC_END, j):
+            m = _WS_RUN.match(text, j + len(FUNC_END)).end()
+            if text.startswith(CALL_END, m):
+                return m
+            return -1 if _prefix_of(CALL_END, text, m) else _find(text, CALL_END, j)
+        elif _prefix_of(PARAM_START, text, j) or _prefix_of(FUNC_END, text, j):
             return -1
         else:
-            return text.find(CALL_END, pos)
+            return _find(text, CALL_END, j)
 
 
 def tool_choice_of(tool_choice) -> tuple[str, str | None]:
@@ -782,7 +1104,7 @@ def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
 PARAM_START = "<parameter="
 
 
-def function_end(text: str) -> int:
+def function_end(text: str, settle: bool = False) -> int:
     """Where a `<function=NAME>...</function>` at the start of `text` ends (just past `</function>`), walking its
     parameters with param_end like call_end does; -1: not complete (or not in the call format)."""
     s = text.lstrip()
@@ -801,7 +1123,7 @@ def function_end(text: str) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:])
+            end = param_end(text[gt + 1:], settle=settle)
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -839,6 +1161,63 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
     return ToolCall(name=obj["name"], arguments=args) if isinstance(args, dict) else None
 
 
+REF_DEPTH = 8            # most `$ref` hops followed when deciding whether a schema can only hold a string
+
+
+def _ref_target(ref, root) -> dict | None:
+    """The schema a local `#` / `#/a/b` reference points to inside the tool's parameters schema, or None when it is
+    not a local pointer or does not resolve: an external, anchor or dangling reference is never assumed to be a string."""
+    if not isinstance(ref, str) or not isinstance(root, dict) or not (ref == "#" or ref.startswith("#/")):
+        return None
+    node = root
+    for part in ([] if ref == "#" else ref[2:].split("/")):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return None
+    return node if isinstance(node, dict) else None
+
+
+def string_only(schema, root=None, _depth: int = 0) -> bool:
+    """Whether a parameter schema can only ever hold a string: `type: "string"` (as before), `type: ["string"]`, a
+    `$ref` to such a schema inside `root` (the tool's parameters), `anyOf` / `oneOf` whose every branch is, and
+    `enum` / `const` of strings without a `type`.  Anything else - number, boolean, object, array, nullable or real
+    unions (`["string", "null"]`, `anyOf string | boolean`), no type at all - is not decided here and keeps the
+    JSON-first reading: the text format cannot tell `"true"` from `true` where both are allowed."""
+    if not isinstance(schema, dict) or _depth > REF_DEPTH:
+        return False
+    kind = schema.get("type")
+    if kind == "string":
+        return True
+    if isinstance(kind, list):
+        return kind == ["string"]
+    if kind is not None:
+        return False
+    if "$ref" in schema:
+        target = _ref_target(schema["$ref"], root)
+        return target is not None and string_only(target, root, _depth + 1)
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return all(isinstance(x, str) for x in enum)
+    if isinstance(schema.get("const"), str):
+        return True
+    for key in ("anyOf", "oneOf"):
+        branches = schema.get(key)
+        if isinstance(branches, list) and branches:
+            return all(string_only(b, root, _depth + 1) for b in branches)
+    return False
+
+
+def declared_type(prop, root=None):
+    """The type the parser acts on for a parameter's schema: "string" when it can only hold a string (see
+    string_only), else its declared `type` (None when there is none).  The one decision the direct parser and the
+    streaming scanner share."""
+    return "string" if string_only(prop, root) else (prop or {}).get("type")
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
@@ -848,7 +1227,8 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         raise ValueError("malformed tool call: " + body[:80])
     name = body[len("<function="):body.index(">")].strip()      # `<function= capture>`: the model's stray space
     rest = body[body.index(">") + 1:]
-    props = ((schema or {}).get("parameters") or {}).get("properties") or {}
+    params = (schema or {}).get("parameters") or {}
+    props = params.get("properties") or {}
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
@@ -861,7 +1241,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        declared = (props.get(pname) or {}).get("type")
+        declared = declared_type(props.get(pname), params)
         if declared == "string":
             args[pname] = value
         else:
@@ -901,6 +1281,8 @@ class OutputParser:
         # form is the call - `<parameter=NAME>` as the opener, JSON inside <tool_call>, a bare <function=NAME> at the
         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
         self.recover = recover
+        self.settle = False          # finish(): the turn is over, an ambiguous </parameter> takes the old rule's end
+        self.loose_original = None  # (canonical, original) opener of the call currently buffered
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._reset_scan()
@@ -912,6 +1294,26 @@ class OutputParser:
         ok = self._opener_ok()
         self.fence, self.line, self.ticks = snap
         return ok
+
+    def _loose_open(self, after: str):
+        """A drifted opener inside <tool_call>, for an exactly declared tool; hold a possible prefix.
+        Newline-containing tags stay text, so whole and fragmented inputs use the same one-line grammar.
+        Existing canonical-call and Responses/no-tools policies are handled by the caller, unchanged."""
+        m = _LOOSE_OPEN.match(after)
+        if m:
+            name = m.group(1)
+            return (name, m.end()) if name in self.schemas else None
+        if ">" in after or "\n" in after or "\r" in after or not after.startswith("<"):
+            return None
+        if re.search(r"[ \t]{17}", after):
+            return None
+        head = after[1:].lstrip(" \t")
+        if "function".startswith(head) or re.fullmatch(r"function[ \t]*", head):
+            return "wait"
+        partial = _LOOSE_PART.fullmatch(after)
+        if partial and any(k.startswith(partial.group(1)) for k in self.schemas if isinstance(k, str)):
+            return "wait"
+        return None
 
     def _follower(self, after: str) -> str:
         """recover: what a `<tool_call>` followed (after whitespace) by `after` opens: "call" (`<function=`), "param"
@@ -1050,6 +1452,10 @@ class OutputParser:
         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
         self.sfirst = True
         self.sval_started = False
+        self.cstate = {}             # call_end's resumable walk of the call body being collected
+        self.sopen = 0               # <parameter= openers inside the string value handed out so far, still unclosed
+        self.spe = None              # param_end's resumable state for the value being held, and the sp it was made at
+        self.spe_sp = -1
         self.sdeclared = {}
 
     def _wrapped_call_end(self) -> int:
@@ -1064,7 +1470,7 @@ class OutputParser:
                 self._call_end_checked = len(self.buf)
                 return -1
             self._call_end_checked = -1
-        return call_end(self.buf)
+        return call_end(self.buf, self.settle, None if self.recover else self.cstate)
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
@@ -1082,8 +1488,9 @@ class OutputParser:
                     return out
                 name = rest[a + 10:b]
                 self.scall = ToolCall(name=name, arguments={})
-                props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
-                self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+                params = (self.schemas.get(name) or {}).get("parameters") or {}
+                props = params.get("properties") or {}
+                self.sdeclared = {k: declared_type(v, params) for k, v in props.items()}
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1
@@ -1101,7 +1508,7 @@ class OutputParser:
                     self.sp += b + 1
                     if self.sdeclared.get(pname) == "string":
                         args('"')
-                        self.ss, self.sval_started = "str", False
+                        self.ss, self.sval_started, self.sopen, self.spe = "str", False, 0, None
                     else:
                         self.ss = "raw"
                 elif stripped.startswith("</function>"):
@@ -1118,7 +1525,9 @@ class OutputParser:
                         self.sp += 1
                         rest = rest[1:]
                     self.sval_started = True
-                end = param_end(rest)
+                if self.spe is None or self.spe_sp != self.sp or self.spe[3] > len(rest):
+                    self.spe, self.spe_sp = [0, self.sopen, -1, 0], self.sp       # new origin: scan from here
+                end = param_end(rest, settle=self.settle, state=self.spe)
                 if end >= 0:
                     value = rest[:end]
                     if value.endswith("\n"):
@@ -1127,16 +1536,18 @@ class OutputParser:
                     self.sp += end + len(PARAM_END)
                     self.ss = "between"
                     continue
-                # an undecided </parameter> (-2) is held from its start, like a tag still arriving
-                safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END,))
+                # an undecided </parameter> (-2) is held from its start, like a tag still arriving; so is the start
+                # of a <parameter= opener, which the depth carried over the handed-out text must count whole
+                safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END, PARAM_START))
                 if safe > 0 and rest[safe - 1] == "\n":   # may be the trailing newline before </parameter>
                     safe -= 1
                 if safe > 0:
                     args(json.dumps(rest[:safe])[1:-1])
+                    self.sopen = param_depth(rest[:safe], self.sopen)
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest)
+                end = param_end(rest, settle=self.settle)
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -1195,7 +1606,7 @@ class OutputParser:
                 # #804: a `<tool_call>` inside the reasoning, with tools declared.  It is held whole (never streamed
                 # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
                 body = self.buf[len(CALL_START):]
-                end, think = call_end(body), body.find(THINK_END)
+                end, think = call_end(body, self.settle), body.find(THINK_END)
                 if end >= 0 and (think < 0 or think >= end):
                     call = None
                     try:
@@ -1327,6 +1738,21 @@ class OutputParser:
                 # it is prose that names the format ("I'll use a <tool_call> block") - content, not a malformed call
                 # that ends the request.  Until its follower has arrived it is held, like a partial tag.
                 after = self.buf[i + len(CALL_START):].lstrip()
+                if self.schemas and not after.startswith(FUNC_START):
+                    loose = self._loose_open(after)
+                    if loose == "wait":
+                        j = i
+                        while j > 0 and self.buf[j - 1] == "\n":
+                            j -= 1
+                        if j > 0:
+                            out.append(Event("content", self._track(self.buf[:j])))
+                            self.buf = self.buf[j:]
+                        return out
+                    if loose:
+                        at = len(self.buf) - len(after)
+                        self.loose_original = (FUNC_START + loose[0] + ">", after[:loose[1]])
+                        self.buf = self.buf[:at] + FUNC_START + loose[0] + ">" + after[loose[1]:]
+                        continue
                 kind = self._follower(after) if self.recover else None
                 if kind in ("param", "json"):
                     if i and self.buf[:i].strip():
@@ -1337,6 +1763,7 @@ class OutputParser:
                         rest = rest[:at] + FUNC_START + after[len(PARAM_START):]
                     self.buf = rest
                     self.state = "call" if kind == "param" else "json"
+                    self.cstate = {}
                     continue
                 if kind == "wait":
                     after = ""
@@ -1356,6 +1783,7 @@ class OutputParser:
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
+                self.cstate = {}
             elif self.state == "json":
                 # recover: `{"name": ..., "arguments": {...}}` inside the wrapper is the call once its </tool_call> has
                 # arrived and it names a declared tool; anything else is the text it is
@@ -1371,8 +1799,9 @@ class OutputParser:
                 self.state, self.lead = "content", call is not None
             else:
                 drop = None
+                next_loose = None
                 if self.bare:                       # no wrapper: the call ends at its </function>; a stray
-                    i = function_end(self.buf)      # </tool_call> after it is the wrapper's closer, dropped
+                    i = function_end(self.buf, self.settle)   # </tool_call> after it is the wrapper's closer, dropped
                     if i >= 0:
                         after = self.buf[i:].lstrip()
                         if after.startswith(CALL_END):
@@ -1389,7 +1818,16 @@ class OutputParser:
                         if nxt.startswith(PARAM_START) and self._follower(nxt) == "param":
                             at = len(self.buf) - len(nxt)
                             self.buf = self.buf[:at] + FUNC_START + nxt[len(PARAM_START):]
+                            self.spe = None                  # the buffer was rewritten: a held scan is stale
                             nxt = self.buf[at:]
+                        if self.schemas and not nxt.startswith(FUNC_START):
+                            loose = self._loose_open(nxt)
+                            if isinstance(loose, tuple):
+                                at = len(self.buf) - len(nxt)
+                                next_loose = (FUNC_START + loose[0] + ">", nxt[:loose[1]])
+                                self.buf = self.buf[:at] + next_loose[0] + nxt[loose[1]:]
+                                self.spe = None
+                                nxt = self.buf[at:]
                         if nxt.startswith(FUNC_START):
                             i, drop, self.batch = f, 0, True
                 if self.stream_tools:
@@ -1408,6 +1846,7 @@ class OutputParser:
                 out += self._finish_call(body)
                 if batch and out[-1].kind == "tool_call":
                     self.state, self.lead = "call", False
+                    self.loose_original = next_loose
 
     def finish(self, reason: str | None = None) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
@@ -1415,6 +1854,14 @@ class OutputParser:
         how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []
+        if self.buf and self.state in ("call", "rcall"):
+            # a call held back on a </parameter> only a later end could settle (a whole <parameter=> example inside
+            # a value, or an unclosed mention): the turn is over, so the old rule's end stands - settle it now
+            self.settle = True
+            try:
+                out += self.feed("")
+            finally:
+                self.settle = False
         if self.pending:
             out += self._release(reason in (None, "stop") and self.state == "reasoning" and not self.buf)
         if self.state == "call" and self.bare and function_end(self.buf) >= 0:
@@ -1428,8 +1875,9 @@ class OutputParser:
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
             if self.ss == "done":               # only its </tool_call> is missing: the call itself is whole
-                out.append(Event("tool_call", call=self.scall))
+                out.append(Event("tool_call", call=self._whole_call()))
             self.buf = ""
+            self.loose_original = None
             self._reset_scan()
             return out
         if self.state == "reasoning" and self.buf == THINK_END:   # the output ends on a held `</think>`: its end
@@ -1438,14 +1886,31 @@ class OutputParser:
             # an unfinished call inside the reasoning (#804) is reasoning text, never a call
             kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
             text = CALL_START + self.buf if self.state in ("call", "json") and not self.bare else self.buf
+            if self.loose_original is not None:
+                text = text.replace(*self.loose_original, 1)
             out.append(Event(kind, text))
             self.buf = ""
+        self.loose_original = None
         return out
+
+    def _whole_call(self) -> ToolCall:
+        """The streamed call whose `</function>` was read, with its real arguments: the same evaluation a call that ends
+        with `</tool_call>` gets (_finish_call), under the id already announced.  A new object: the announced one went out
+        with the earlier events and stays as it was.  A body that does not parse keeps the announced call (as before)."""
+        body = self.buf[:self.sp]
+        name = body.strip()[len(FUNC_START):].split(">", 1)[0].strip()
+        try:
+            call = parse_tool_call(body, self.schemas.get(name))
+        except ValueError:
+            return self.scall
+        call.id = self.scall.id
+        return call
 
     def _finish_call(self, body: str) -> list[Event]:
         """A whole call body in the template's form -> its tool_call event.  With recover, one that still does not
         parse is the text it is instead of an error that ends the request."""
         name = body.strip()[len(FUNC_START):].split(">", 1)[0].strip()
+        original, self.loose_original = self.loose_original, None
         bare, self.bare = self.bare, False
         try:
             call = parse_tool_call(body, self.schemas.get(name))
@@ -1454,7 +1919,10 @@ class OutputParser:
                 raise
             self._reset_scan()
             self.state = "content"
-            return [Event("content", self._track(body if bare else CALL_START + body + CALL_END))]
+            text = body if bare else CALL_START + body + CALL_END
+            if original is not None:
+                text = text.replace(*original, 1)
+            return [Event("content", self._track(text))]
         if self.scall is not None:
             call.id = self.scall.id
         self._reset_scan()

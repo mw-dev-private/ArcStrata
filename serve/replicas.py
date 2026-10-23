@@ -187,7 +187,10 @@ class ReplicaEngine:
         d["run_locks"] = [threading.Lock() for _ in engines]    # an engine without batch slots: one request at a time
         d["lock"] = threading.Lock()
         d["tl"] = threading.local()
-        d["healing"] = {}
+        d["healing"] = {}                        # replica -> its reservation token (generation, id)
+        d["heal_lock"] = threading.Lock()        # eligibility + reservation per replica: one heal job, atomically
+        d["heal_gen"] = [0] * len(engines)       # bumped by unload/close/explicit restart: old jobs are void
+        d["heal_seq"] = 0
         d["heal_at"] = [0.0] * len(engines)
         d["routed"] = [0] * len(engines)
         d["gen_seen"] = [getattr(e, "gen", 0) for e in engines]
@@ -306,6 +309,10 @@ class ReplicaEngine:
     # ---- life cycle
     def restart(self, tries: int = 3):
         dead = [k for k, e in enumerate(self.engines) if not e.alive()]
+        with self.heal_lock:                     # an explicit restart voids queued heal jobs for these replicas
+            for k in dead:
+                self.heal_gen[k] += 1
+                self.healing.pop(k, None)
         errors: dict[int, BaseException] = {}
 
         def one(k):
@@ -325,12 +332,20 @@ class ReplicaEngine:
             print(f"[strata] replica {k} did not start ({e}); the others serve", flush=True)
 
     def unload(self):
+        with self.heal_lock:                     # void the queued heal jobs before the engines go down
+            for k in range(len(self.engines)):
+                self.heal_gen[k] += 1
+                self.healing.pop(k, None)
         for e in self.engines:
             e.unload()
         for k in range(len(self.engines)):
             self.router.forget(k)
 
     def close(self):
+        with self.heal_lock:                     # nothing queued may restart what is being closed
+            for k in range(len(self.engines)):
+                self.heal_gen[k] += 1
+                self.healing.pop(k, None)
         err = None
         for e in self.engines:
             try:
@@ -359,16 +374,25 @@ class ReplicaEngine:
 
     def heal(self) -> None:
         """Start a replica that died again, in the background (the others keep serving)."""
-        now = time.monotonic()
-        for k, e in enumerate(self.engines):
-            if e.alive() or getattr(e, "unloaded", False) or getattr(e, "starting", False) or self.healing.get(k):
-                continue
-            if now < self.heal_at[k]:
-                continue
-            self.heal_at[k] = now + HEAL_COOLDOWN_S
-            self.healing[k] = True
+        reserved = []
+        with self.heal_lock:                     # check and reserve together: two callers cannot both schedule
+            now = time.monotonic()
+            for k, e in enumerate(self.engines):
+                if e.alive() or getattr(e, "unloaded", False) or getattr(e, "starting", False) or self.healing.get(k):
+                    continue
+                if now < self.heal_at[k]:
+                    continue
+                self.heal_seq += 1
+                token = (self.heal_gen[k], self.heal_seq)
+                self.healing[k] = token
+                self.heal_at[k] = now + HEAL_COOLDOWN_S
+                reserved.append((k, token))
 
-            def run(k=k):
+        for k, token in reserved:                # started outside the lock: no lock is held over restart/join
+            def run(k=k, token=token):
+                with self.heal_lock:             # the atomic claim: still the same generation and reservation?
+                    if self.healing.get(k) != token or self.heal_gen[k] != token[0]:
+                        return                   # unloaded/closed/restarted after it was queued: void
                 try:
                     print(f"[strata] replica {k} had stopped; starting it again", flush=True)
                     self.engines[k].restart()
@@ -377,8 +401,16 @@ class ReplicaEngine:
                 except BaseException as x:       # noqa: BLE001
                     print(f"[strata] replica {k} did not start again: {x}", flush=True)
                 finally:
-                    self.healing[k] = False
-            threading.Thread(target=run, daemon=True).start()
+                    with self.heal_lock:
+                        if self.healing.get(k) == token:   # never remove a newer reservation
+                            del self.healing[k]
+            try:
+                threading.Thread(target=run, daemon=True).start()
+            except BaseException as x:           # noqa: BLE001
+                with self.heal_lock:
+                    if self.healing.get(k) == token:   # no thread, no reservation; the cooldown still applies
+                        del self.healing[k]
+                print(f"[strata] replica {k} was not healed ({x})", flush=True)
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         # imported here: serve.server imports this module

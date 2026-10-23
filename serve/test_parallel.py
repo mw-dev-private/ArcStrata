@@ -69,11 +69,43 @@ def window():        # one batch window: every active slot one token
             continue
         t = left.pop(0) if left else 257
         produced += 1
-        print(f"BT {b} {t}", flush=True)
+        word = f"{t}"
+        if produced == 3:                                    # A03f fixtures: one corrupt TOKEN word per
+            if "--bt-text" in args: word = "x"                #  flagged run (printf %d never prints any
+            elif "--bt-arabic" in args: word = "\u0667"       #  of these forms): non-numeric / a Unicode
+            elif "--bt-negative" in args: word = f"{-t}"      #  digit int() PARSES (7!) / a sign / an
+            elif "--bt-extra" in args: word = f"{t} 9"        #  extra field / a MISSING field ("BT 1 ")
+            elif "--bt-trunc" in args: word = ""
+        if "--bt-eofcut" in args and produced == 3:          # complete record WITHOUT its newline, then
+            print(f"BT {b} {t}", end="", flush=True)         #  the process dies: the pump yields the
+            sys.exit(0)                                      #  whole trailing line - a real token
+        if "--bt-eoftrunc" in args and produced == 3:        # genuinely TRUNCATED: token field missing
+            print(f"BT {b} ", end="", flush=True)            #  at death - split() has no field [2]
+            sys.exit(0)
+        print(f"BT {b} {word}", flush=True)
         if t == 257 or produced >= max_new:
             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
             stopped.discard(b)
+            if fin == 'stop' and (DIE_EOS or SILENT_EOS):   # A03d fixtures: what follows a slot's EOS token
+                del active[b]
+                if DIE_EOS:
+                    sys.exit(0)    # the engine dies RIGHT HERE: its pump sends EOF instead of the BDONE
+                continue           # SILENT_EOS: alive, but this slot's BDONE never comes
+            if fin == 'stop' and "--malformed-bdone" in args:   # A03e: the process dies MID-RECORD: an
+                del active[b]                                  #  unterminated, truncated BDONE at EOF
+                print(f"BDONE {b} {produced} st", end="", flush=True)
+                sys.exit(0)
+            if fin == 'stop' and "--unicode-bdone" in args:    # A03e r03 fixture: a malformed NUMBER word
+                del active[b]                                  #  (isdigit() True, int() raises) - engine
+                print(f"BDONE {b} \u00b2 stop 1.0", flush=True)  #  lives on SILENT for this slot: the
+                continue                                       #  helper-timeout arm must not crash/leak
             print(f"BDONE {b} {produced} {fin} 1.0", flush=True)
+            if "--spoof-mid" in args and not SPOOF["done"]:   # A03e fixture: a forged BDONE word lands
+                SPOOF["done"] = True                          #  MID-decode in the other slot's stream
+                print("BDONE 1 99 stop 7.0", flush=True)      #  (native printf can never forge this)
+            if "--unicode-mid" in args and not SPOOF["done"]:  # A03e r03: malformed NUMBER mid-decode
+                SPOOF["done"] = True                          #  (isdigit True / int ValueError crash)
+                print("BDONE 1 \u00b2 stop 1.0", flush=True)
             del active[b]
         else:
             active[b] = [left, max_new, produced]
@@ -81,6 +113,18 @@ log = open(args[args.index("--log") + 1], "a") if "--log" in args else None
 PPK = int(args[args.index("--pp-every") + 1]) if "--pp-every" in args else 1
 READF = "--readfield" in args   # DONE's 15th field: the prompt tokens the engine read (a continued prompt: the 1 it copies)
 REUSE = "--reuse" in args     # DONE's reused field as the engine gives it: a continued prompt is all held but its last
+DIE_EOS = "--die-after-eos" in args        # A03d: exit the fake at a slot's EOS, before its BDONE (real pump EOF)
+SILENT_EOS = "--silent-after-eos" in args  # A03d: alive, but no BDONE after a slot's EOS (the timeout arm's fixture)
+SPOOF = {"done": False}
+PPX = {"done": False}                       # A03g: one corrupted progress line per fixture run
+PBD = args[args.index("--pp-bad") + 1] if "--pp-bad" in args else ""       # sup|arabic|text|inf
+YBD = args[args.index("--yielded-bad") + 1] if "--yielded-bad" in args else ""   # sup|own|foreign
+DBD = args[args.index("--done-bad") + 1] if "--done-bad" in args else ""   # A03h: sup|arabic|huge|
+DDX = {"done": False}                                                     #  infms|finish|trunc|group9|kv*
+if "--garbage-bdone" in args:              # A03e fixture: corrupt BDONE words on the pipe the NATIVE emitter
+    print("BDONE -1 3 stop 1.0", flush=True)      #  cannot print (printf %d never goes negative); a stream or
+    print("BDONE 999 3 stop 1.0", flush=True)     #  crash protection test - routing must drop them, never route
+    print("BDONE x 1 stop 1.0", flush=True)       #  them by wraparound or into the control stream
 def reused(ids):              # token (the request's own output included), a fresh one the first 3 tokens
     return 0 if not REUSE else len(ids) - 1 if continued(ids)[1] else 3
 while True:
@@ -134,7 +178,18 @@ while True:
             time.sleep(STEP / 2)
             if (q // CH) % PPK:   # --pp-every K: a PP line and a boundary every K chunks (the pipelined groups' pieces)
                 continue
-            print(f"PP {q} {len(ids)} 1 1", flush=True)
+            if PBD and not PPX["done"] and PBD != "arabic":   # A03g fixtures: ONE corrupt PP word set
+                PPX["done"] = True                            #  (printf %lld/%.0f/%.1f never does)
+                if PBD == "sup":   print(f"PP \u00b2 {len(ids)} 1 1", flush=True)      # isdigit True, int raises
+                elif PBD == "text": print(f"PP {q} {len(ids)} x x", flush=True)        # ms/rate non-numeric
+                elif PBD == "inf":                                             # ms/rate PARSE as inf today
+                    print(f"PP {q} {len(ids)} inf inf", flush=True)
+                    time.sleep(0.6)                                            # let /status observe it
+                continue
+            if PBD == "arabic" and q + CH >= len(ids) - 1:    # LAST PP of the read: Arabic-Indic seven:
+                print(f"PP \u0667 {len(ids)} 1 1", flush=True) #  int() PARSES (7) - fabricated progress
+            else:
+                print(f"PP {q} {len(ids)} 1 1", flush=True)
             held = []
             while True:
                 try:
@@ -169,9 +224,26 @@ while True:
             print(f"T {t}", flush=True)
             out += 1
             time.sleep(STEP)
+        if YBD and slot is not None and not PPX["done"]:     # A03g: a YIELDED line the native emitter
+            PPX["done"] = True                               #  never prints (no BYIELD preceded it):
+            if YBD == "sup":   print("YIELDED \u00b2 7", flush=True)      # int() raises: 400 blames the client
+            elif YBD == "own": print(f"YIELDED {slot} 99999", flush=True)  # bogus count for the OWN slot
+            elif YBD == "foreign": print("YIELDED 5 7", flush=True)        # a count for a foreign slot
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
-        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused(ids)}" +
-              (f" 0 0 0 0 0.0 {len(ids) - reused(ids)}" if READF else ""), flush=True)
+        if DBD and not DDX["done"]:                        # A03h fixtures: the engine's OWN DONE lies
+            DDX["done"] = True                             #  (printf %lld/%.1f/%s never does these)
+            if DBD == "sup":       print(f"DONE \u00b2 {len(ids)} 5.0 1.0 {fin} 0 0 0", flush=True)         # int() raises
+            elif DBD == "arabic":  print(f"DONE \u0667 {len(ids)} 5.0 1.0 {fin} 0 0 0", flush=True)         # int() PARSES (7)
+            elif DBD == "huge":    print(f"DONE {'9' * 1000} {len(ids)} 5.0 1.0 {fin} 0 0 0", flush=True)  # beyond %lld
+            elif DBD == "infms":   print(f"DONE {out} {len(ids)} inf \u0667 {fin} 0 0 0", flush=True)       # float() PARSES both
+            elif DBD == "finish":  print(f"DONE {out} {len(ids)} 5.0 1.0 stopped 0 0 0", flush=True)       # not an engine word
+            elif DBD == "trunc":   print(f"DONE {out} {len(ids)}", flush=True)                             # cut inside the core
+            elif DBD == "group9":  print(f"DONE {out} {len(ids)} 5.0 1.0 {fin} \u00b2 0 0", flush=True)    # optional group lies
+            elif DBD == "kvsup":   print(f"DONE {out} {len(ids)} 5.0 1.0 {fin} 0 0 {reused(ids)} 0 0 0 0 0.0 {len(ids)} 0 chunk=\u00b2 experts_streamed=0", flush=True)
+            elif DBD == "kvarabic": print(f"DONE {out} {len(ids)} 5.0 1.0 {fin} 0 0 {reused(ids)} 0 0 0 0 0.0 {len(ids)} 0 chunk=\u0667 experts_streamed=0", flush=True)
+        else:
+            print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused(ids)}" +
+                  (f" 0 0 0 0 0.0 {len(ids) - reused(ids)}" if READF else ""), flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
             if cont:
