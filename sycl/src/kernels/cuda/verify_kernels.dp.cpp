@@ -2369,6 +2369,67 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     }
     check("resident_plan");
 }
+namespace {
+// Upstream PR #3545: token 0 keeps all k picks, the tail keeps the top (cap - k) by (weight desc, index asc); the
+// rest fold round-robin onto a kept expert at weight 0 (no expert read, zero contribution - every combine path
+// multiplies by the weight).  Thread 0 builds the whole decision in local memory (n <= kResidentPlanMax entries,
+// no atomics); the barrier hands it to the writers.  Folding the drops into ONE group was measured upstream and
+// rejected (a single large group serialized the grouped GEMV).
+__dpct_inline__ void verify_ecap_kernel(int32_t* __restrict__ ids, float* __restrict__ w, int n, int k, int cap,
+                                        int32_t* s_keep, int* s_nkeep, int* s_verdict, int tid) {
+    if (tid == 0) {
+        const int keep = cap - k;
+        *s_nkeep = 0;
+        for (int i = 0; i < n; ++i) s_verdict[i] = -1;
+        for (int i = 0; i < k; ++i) {                  // token 0's picks are always kept
+            s_keep[(*s_nkeep)++] = ids[i];
+            s_verdict[i] = -1;
+        }
+        if (keep > 0) {
+            for (int sel = 0; sel < keep; ++sel) {     // the top-`keep` speculative entries by (w desc, index asc)
+                int best = -1;
+                for (int j = k; j < n; ++j) {
+                    if (s_verdict[j] != -1) continue;
+                    if (best < 0 || w[j] > w[best]) best = j;
+                }
+                if (best < 0) break;
+                s_verdict[best] = -2;                  // kept by rank (marker, not folded)
+                s_keep[(*s_nkeep)++] = ids[best];
+            }
+            int fold = 0;
+            for (int j = k; j < n; ++j)                // the rest fold round-robin over the kept experts
+                if (s_verdict[j] == -1) s_verdict[j] = fold++ % *s_nkeep;
+        }
+    }
+}
+}  // namespace
+
+void verify_ecap(int32_t* ids, float* w, int n, int k, int cap, void* stream) {
+    if (n <= k || cap <= k) return;                    // one token's window, or nothing to drop
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<class verify_ecap_kernel_5f0c21>>(
+                sycl::nd_range<3>(sycl::range(1, 1, kResidentPlanMax), sycl::range(1, 1, kResidentPlanMax)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                    auto& s_keep = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[kResidentPlanMax]>(
+                        item_ct1.get_group());
+                    auto& s_verdict = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[kResidentPlanMax]>(
+                        item_ct1.get_group());
+                    auto& s_nkeep = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(item_ct1.get_group());
+                    const int tid = item_ct1.get_local_id(2);
+                    verify_ecap_kernel(ids, w, n, k, cap, s_keep, &s_nkeep, s_verdict, tid);
+                    item_ct1.barrier();
+                    if (tid >= n || s_nkeep <= 0) return;
+                    const int v = s_verdict[tid];
+                    if (v >= 0) {                      // dropped: fold into kept group v at weight 0
+                        ids[tid] = s_keep[v];
+                        w[tid] = 0.0f;
+                    }
+                });
+    }
+    check("verify_ecap");
+}
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     const uint32_t spin_max = strata::spin_max(*strata::q_of(stream));
     {

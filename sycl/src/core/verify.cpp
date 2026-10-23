@@ -1327,6 +1327,13 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
+        // STRATA_VERIFY_ECAP (relaxed MTP, opt-in, upstream PR #3545): cap the window's expert set before the plan -
+        // token 0 keeps all K picks, the speculative tail keeps the top (cap - K) by routing weight, the rest fold
+        // onto a kept expert at w = 0: no extra expert read, contribution exactly zero.  Inside the window, so the
+        // capture stays one graph.
+        static const int ecap = [] { const char* v = std::getenv("STRATA_VERIFY_ECAP"); return v ? std::atoi(v) : 0; }();
+        if (ecap > K && n > 1)
+            strata::kernels::verify_ecap(ids_ + tb * K, w_ + tb * K, n * (int) K, (int) K, ecap, cs);
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,

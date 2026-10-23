@@ -3,6 +3,8 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <cstring>
 #include <utility>
@@ -136,6 +138,30 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         total += b;
     }
     if (take.empty()) return 0;
+#if !defined(_WIN32)
+    // STRATA_MIRROR_DROP_CACHE=before (PR #3761/#3681, ported): the start-up reads leave the GGUFs in the page cache,
+    // so on a host close to the model's size the mirror's chunks are allocated under reclaim - and an Arc B70 reads
+    // reclaim-backed chunks at 55-85 % of the bandwidth of chunks from free memory (decode after a restart depended
+    // on what the page cache held).  Dropping the files' cache first makes the chunks free-backed; the mirror fill
+    // then reads from disk (~+1 s).  Off by default; Linux only.
+    if (const char* drop = std::getenv("STRATA_MIRROR_DROP_CACHE"); drop && std::strcmp(drop, "before") == 0) {
+        auto mem_free_mib = []() -> long {
+            FILE* f = std::fopen("/proc/meminfo", "r");
+            long kib = 0;
+            if (f) {
+                char key[32]; long v = 0; char unit[8];
+                while (std::fscanf(f, "%31s %ld %7s", key, &v, unit) == 3)
+                    if (std::strcmp(key, "MemFree:") == 0) { kib = v; break; }
+                std::fclose(f);
+            }
+            return kib / 1024;
+        };
+        const long before = mem_free_mib();
+        for (int fd : fds_) if (fd >= 0) (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        std::fprintf(stderr, "mirror: STRATA_MIRROR_DROP_CACHE=before: MemFree %ld -> %ld MiB (the mirror needs %llu MiB)\n",
+                     before, mem_free_mib(), (unsigned long long) (total >> 20));
+    }
+#endif
     // Alchemist (Arc A-series) refuses a single USM host allocation past ~3 GiB (docs/INTEL.md, A750), so the mirror
     // is built from chunks under that. Battlemage and the CUDA/HIP builds never hit the limit, but chunking is neutral
     // for them. One chunk per (up to) 2 GiB of experts.
