@@ -2818,7 +2818,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 nj.blob = b;
                 nj.nt = 0;
             }
-            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+            // PR #3805 port: a job's arrays hold MAXT rows.  A batch window can route more than MAXT rows to the
+            // same expert (repeated ids, several slots), which wrote past act[]/out[] before.  Start another job for
+            // the same expert instead: no routed output is dropped, and every job keeps its own blob pointer.
+            ExpertJobMulti* jbp = &d.jobs_multi[(size_t) jo];
+            if (jbp->nt >= strata::kernels::cpu::MAXT) {
+                if (njobs >= (int) d.jobs_multi.size()) {
+                    d.failed = true;
+                    d.fail = "the expert job table overflowed (MAXT rows per job)";
+                    return;
+                }
+                const int16_t jn = (int16_t) njobs++;
+                ExpertJobMulti& nn = d.jobs_multi[(size_t) jn];
+                nn.blob = jbp->blob;
+                nn.nt = 0;
+                d.job_of[(size_t) e] = (int16_t) jn;
+                jbp = &nn;
+            }
+            ExpertJobMulti& jb = *jbp;
             jb.act[jb.nt] = &d.act_multi[(size_t) t];
             jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
             jb.out[jb.nt] = row;
