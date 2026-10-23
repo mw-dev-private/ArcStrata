@@ -6,6 +6,8 @@ branch built on it. It serves **Qwen3.8-Flash-Next (GSQ-RCO IQ3_S)** on an **Int
 agent, a local assistant and an MCP client. Contributors are named at the bottom; the direction, the hypotheses
 and the dead ends are mine.
 
+Next up: get rid of phyton.
+
 **All the numbers on this page are mine, measured on this PC.** For Strata itself, its install and its own speed
 tables see the [upstream README](https://github.com/Niko1221/Strata#readme) and, for the Intel port in general,
 [docs/INTEL.md](docs/INTEL.md). The exact live state of today — binary, commit, flags, deployment chain, open
