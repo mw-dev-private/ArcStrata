@@ -1,9 +1,10 @@
 # ArcStrata — Qwen3.8-Flash-Next on an Intel Arc Pro B70 32 GB
 
-*mw-dev-private, October 2026.* **ArcStrata** is a lean, Intel-Arc-only build of [Strata](https://github.com/Niko1221/Strata) (MIT): the SYCL work and the
-settings I run every day to serve **Qwen3.8-Flash-Next (GSQ-RCO IQ3_S)** on an **Intel Arc Pro B70** behind a coding
-agent, a local assistant and an MCP client. Work done with several coding agents (Claude/Codex/OpenCode) as the
-assistants; the direction, the hypotheses and the dead ends are mine.
+*mw-dev-private, October 2026.* **ArcStrata** is a lean, Intel-Arc-only line built on
+[Strata](https://github.com/Niko1221/Strata) (MIT): the idea and the engine are Strata's; this is the Intel-only
+branch built on it. It serves **Qwen3.8-Flash-Next (GSQ-RCO IQ3_S)** on an **Intel Arc Pro B70** behind a coding
+agent, a local assistant and an MCP client. Contributors are named at the bottom; the direction, the hypotheses
+and the dead ends are mine.
 
 **All the numbers on this page are mine, measured on this PC.** For Strata itself, its install and its own speed
 tables see the [upstream README](https://github.com/Niko1221/Strata#readme) and, for the Intel port in general,
@@ -103,4 +104,18 @@ flows back upstream — this is my production box.
 Speeds depend on the card, the RAM and the kind of text: these are one PC's numbers, not a promise. Nothing here was
 tested for multi-GPU or vision throughput.
 
-License: MIT, as upstream.
+## Origin and contributors
+
+**Origin.** The idea and the engine are [Strata](https://github.com/Niko1221/Strata) by Niko1221, MIT. ArcStrata is an
+independent, Intel-Arc-only line built on it; upstream is not responsible for anything in this repository.
+
+**Contributors — these four, and nobody else:**
+
+- **Markus** ([mw-dev-private](https://github.com/mw-dev-private)) — direction, hypotheses, measurements, dead ends
+- **DeepSeek** (deepseek-flash, DSH) — code, integration, measurements, documentation
+- **OpenAI Codex** — code, reviews
+- **Anthropic Claude** — code, reviews
+
+## License
+
+MIT, as upstream.
