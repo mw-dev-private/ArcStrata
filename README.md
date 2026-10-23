@@ -6,11 +6,16 @@ branch built on it. It serves **Qwen3.8-Flash-Next (GSQ-RCO IQ3_S)** on an **Int
 agent, a local assistant and an MCP client. Contributors are named at the bottom; the direction, the hypotheses
 and the dead ends are mine.
 
-Next up: get rid of phyton.
+> [!WARNING]
+> **Work in progress.** ArcStrata is the Intel-Arc-only line, not a stable release. The Python serve/control layer
+> is still upstream Strata's; the next step is to remove Python and replace it with the Rust server (`server-rs`,
+> work in progress). Until that lands, this tree is the running snapshot, not an API promise.
+
+**Next up: remove Python.**
 
 **All the numbers on this page are mine, measured on this PC.** For Strata itself, its install and its own speed
 tables see the [upstream README](https://github.com/Niko1221/Strata#readme) and, for the Intel port in general,
-[docs/INTEL.md](docs/INTEL.md). The exact live state of today — binary, commit, flags, deployment chain, open
+[docs/INTEL.md](docs/INTEL.md). The live state as of 2026-10-20 — binary, commit, flags, deployment chain, open
 findings — is snapshotted in [docs/PROD-STATE-2026-10-20.md](docs/PROD-STATE-2026-10-20.md).
 
 > **Name and lineage.** ArcStrata is this branch — not XeStrata and not JR-Strata, which are other, independent
@@ -18,10 +23,9 @@ findings — is snapshotted in [docs/PROD-STATE-2026-10-20.md](docs/PROD-STATE-2
 
 > [!IMPORTANT]
 > **ArcStrata is Intel Arc only, and it is only the B70.** Everything here is the Intel engine: the SYCL sources under
-> `sycl/`, built with `-DSTRATA_ENABLE_SYCL=ON`, after which upstream's own CMake configures nothing else and stops
-> the build outright if `STRATA_ENABLE_CUDA` or `STRATA_ENABLE_HIP` is set as well — the backends are mutually
-> exclusive by design. So **no CUDA, no ROCm, no Metal/Mac, no multi-GPU, no Windows**: those paths are upstream's,
-> they are untouched by this branch, never compiled by my build command, never run and never measured here.
+> `sycl/`, built with `-DSTRATA_ENABLE_SYCL=ON`. **No CUDA, no ROCm, no Metal/Mac, no multi-GPU, no Windows**: those
+> backends are not in this repository (removed in the 2026-10-23 lean cleanup), never compiled by my build command,
+> never run and never measured here.
 > Within Intel: every change was written, compiled, tuned and measured on one card, the **Arc Pro B70 32 GB**
 > (Battlemage, PCI device `8086:e223`, `xe` kernel driver). The box has a second Arc, an **Arc Pro B60**
 > (`8086:e211`), which I use as a test card for kernel experiments and for an embedding backend — it is not the
@@ -44,10 +48,10 @@ findings — is snapshotted in [docs/PROD-STATE-2026-10-20.md](docs/PROD-STATE-2
 | **System** | Linux, kernel 7.0.0-34-generic |
 | **Compiler** | Intel oneAPI DPC++/C++ 2026.1.1 — `icx` and `icpx` both set explicitly |
 | **Build gate** | `-DSTRATA_ENABLE_SYCL=ON`: only `sycl/` is configured; the CUDA/HIP combination is a CMake error |
-| **Device code** | SPIR-V, JIT-compiled for the B70 at first start with a persistent cache (`SYCL_CACHE_PERSISTENT=1`, fixed `SYCL_CACHE_DIR`), device picked by `ONEAPI_DEVICE_SELECTOR=level_zero:0`. `STRATA_SYCL_AOT` is deliberately **unset**; AOT measured ±0 (see the archive branches) |
+| **Device code** | SPIR-V, JIT-compiled for the B70 at first start with a persistent cache (`SYCL_CACHE_PERSISTENT=1`, fixed `SYCL_CACHE_DIR`), device picked by `ONEAPI_DEVICE_SELECTOR=level_zero:0`. `STRATA_SYCL_AOT` is deliberately **unset**; AOT measured ±0 |
 | **Model** | Qwen3.8-Flash-Next GSQ-RCO **IQ3_S** (two GGUF shards, the second passed as `--ple-gguf`) |
-| **Engine** | upstream **v0.2.0-beta** base (`v0.2.0-beta` tag) plus my int8/batch/slot-copy line — running binary `strata-v0145-slotcopy-diagnostics-1d77cd2d-c8d97081`, source on branch **`engine-int8-v020-instr`** |
-| **Serve / control** | this branch: upstream v0.1.45 base (`477ac13`) + port + tokenizer optimizers; config in [prod-config/PT3M-262k.sample.json](prod-config/PT3M-262k.sample.json) |
+| **Engine** | v0.1.45 fast base (`477ac13` line) + the ECAP fixes (in this `main`) — running binary `strata-v0145-ecap16` (sha256 `3110fd2c…`) |
+| **Serve / control** | this branch: upstream v0.1.45 base (`477ac13`) + port + tokenizer optimizers + the Python fixes below; config in [prod-config/PT3M-262k.sample.json](prod-config/PT3M-262k.sample.json) |
 | **Runtime settings** | `--max-context 262144`, `--kv int8`, `--batch 3 --spec 4` (MTP), `--pool-workers 12`, `--pcie-frac 0.20`, `--expert-cache auto`, `--conversation-cache-mib 16384 --conversation-cache-slots 8 --kv-resident 20480`, `--stream-experts`, vision on; armed gates: `STRATA_NATIVE_GRAPH=1`, `STRATA_BATCH_MTP=1`, `STRATA_TAIL_SKIP_IN_BATCH=1`, `STRATA_PREFILL_CPU_SHARE_BATCH=1`, `STRATA_SLOT_COPY_DIRECT=1`, int8 DPAS prompt experts **on by default** on Battlemage |
 
 ## How fast it runs here
@@ -55,15 +59,15 @@ findings — is snapshotted in [docs/PROD-STATE-2026-10-20.md](docs/PROD-STATE-2
 Measured 2026-10-20 against the live server (12 pool workers, frac 0.20, batch 3, single-stream suite, `--runs 1`,
 median of the suite's own repetitions):
 
-| what | measured | notes |
-| --- | --- | --- |
-| **writes answers**, short chat | **67.7 tok/s** (60.7–80.6, n=3) | |
-| **an agent session** | **62.4 tok/s** (53.7–74.1, n=5) | time to first token 2.99 s |
-| **reads a 4K prompt** | **1,423 tok/s** | |
-| **reads a 16K prompt** | **1,803 tok/s** | |
+![Decode and prefill throughput on one Arc Pro B70](docs/media/b70-throughput-2026-10-20.png)
 
-The older 131K-era tables, the A/B port charts and the full flag reference (`B70.md`) live on the archive branches
-`v0145-b70-sycl-fast` and `docs-b70` — same upstream base (`477ac13`), kept untouched.
+*Decode: short chat **67.7 tok/s** (60.7–80.6, n=3), agent session **62.4 tok/s** (53.7–74.1, n=5, 2.99 s to
+first token). Prefill: **1,423 tok/s** at 4K and **1,803 tok/s** at 16K (one run each). Measured 2026-10-20; the
+running binary has since moved to ECAP16 on the same v0.1.45 fast base. The chart is generated by
+[tools/plot_b70_throughput.py](tools/plot_b70_throughput.py).*
+
+The older 131K-era tables and the A/B port charts lived on the archive branches `v0145-b70-sycl-fast` and
+`docs-b70`; both were removed in the 2026-10-23 lean cleanup.
 
 One honesty note that matters for reproductions: with `STRATA_TAIL_SKIP_IN_BATCH=1` a slot's answer **depends on
 which other slots are busy** (the skip decision sees the whole window), and the serve path is not bit-stable
@@ -83,6 +87,10 @@ run-to-run on long greedy generations. Parity tests need an identical side load,
   conversations 6× — details in `docs/PROD-STATE-2026-10-20.md`.
 - **Context doubled to 262,144 tokens**, batch serve with 3 slots is the normal mode, pool workers 12 at PCIe frac
   0.20 is today's baseline.
+- **2026-10-23 — the repository was cut down to the Intel-only line**: the running binary is
+  `strata-v0145-ecap16` (v0.1.45 fast + ECAP); the old v0.2.0-beta/engine-int8 line and the archive branches were
+  retired, and native CUDA, Metal, Windows/ROCm tooling and every benchmark result not measured on this PC were
+  removed.
 
 ## What is in ArcStrata
 
@@ -98,13 +106,37 @@ run-to-run on long greedy generations. Parity tests need an identical side load,
   — in-place Q6 head planes, asynchronous prefill loan refill.
 
 Most engine changes are **opt-in by environment variable**; the int8 prompt experts are the one default-on change.
-**Branches:** `main` = the serve/control line that the running server imports (this tree);
-`engine-int8-v020-instr` = the engine source line of the running binary (v0.2.0-beta + my changes, tip `1d77cd2d`);
-`v0145-b70-sycl-fast` and `docs-b70` = the archived v0.1.45-era state with the flag reference and charts. Nothing
-flows back upstream — this is my production box.
+**Branches:** only `main` — the serve/control line the running server imports, plus the engine source and the ECAP
+fixes. The old `engine-int8-v020-instr`, `v0145-b70-sycl-fast` and `docs-b70` branches and all tags were removed in
+the 2026-10-23 lean cleanup. Nothing flows back upstream — this is my production box.
 
 Speeds depend on the card, the RAM and the kind of text: these are one PC's numbers, not a promise. Nothing here was
 tested for multi-GPU or vision throughput.
+
+## Python fixes vs upstream Strata
+
+The Python layer is still upstream's, but the running tree carries these fixes (the `A…` labels are the internal
+audit IDs; the tests for each live in `serve/`):
+
+- **Process ownership and lifecycle (A16/A17):** process, pump, log and generation are bound to one owner; an old
+  `unload` can no longer unload its successor; a late `EngineStuck` keeps its own owner; a lazily/manually owned
+  process is closed exactly once.
+- **BT token stream (A03f):** a stream line is a token only if the native emitter can print it; a corrupt line ends
+  the request as a 503 engine fault, never a 400 blaming the request and never a fabricated token.
+- **PP / YIELDED / DONE parsing (A03g/A03h):** counters that cannot be printed are rejected instead of fabricating
+  `Infinity`/`nan`/negative values; a corrupt `DONE` ends as an engine fault with the lifecycle intact; the consumed
+  `DONE` reaches the caller before the figures.
+- **Intel wrapper pump (A11c):** the A03e slot routing is restored in the wrapper's pump.
+- **Request accounting (A12b):** with batch slots the control-lock wait is queue time and only the start itself is
+  load time; a start at the request's own turn is recorded as load time, not left unattributed.
+- **Telemetry (A12c):** no double-counted cache event under concurrent `/metrics` polls; a backwards disk counter or
+  a raising reader is a missing sample, and the sampler thread survives.
+- **Frontend:** the billing stamp is pinned only in the header's first 256 characters; colliding literal marks are
+  relocated so original private-use text survives; `unmark_think_literals` uses a sparse `str.find` scan.
+- **Reader / parsers (A12d):** numbers beyond float/int range in the Xe reader and gpustat are rejected instead of
+  crashing the reader.
+- **Embedding file (A04a):** a full `/dev/shm` or disk while writing the combined embeddings file is a 500, not a
+  client that left.
 
 ## Origin and contributors
 
