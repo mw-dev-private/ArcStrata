@@ -14,8 +14,32 @@ const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memo
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
+  // true only when the browser really stored it; a failed write must not look like a saved one
+  set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); return true; } catch (e) { return false; } },
 };
+// One warning per failing stretch and key: an auto-save after every answer must not flood the toasts.
+const storageWarned = Object.create(null);
+function storageFailed(key, title, text) {
+  if (storageWarned[key]) return;
+  storageWarned[key] = true;
+  toast("warn", title, text, 8000);
+}
+function storageWorked(key) { delete storageWarned[key]; }
+// The saved chat: a corrupt value or a failed read starts empty and says so, instead of breaking the page.
+function loadChat() {
+  let raw;
+  try { raw = localStorage.getItem("strata.chat"); } catch (e) {
+    storageFailed("chat-read", "Chat not readable", "This browser did not let the page read its saved chat: the chat starts empty.");
+    return [];
+  }
+  if (raw === null) return [];
+  try {
+    const v = JSON.parse(raw);
+    if (Array.isArray(v)) return v;
+  } catch (e) { /* unreadable: handled below */ }
+  storageFailed("chat-read", "Chat not readable", "The saved chat in this browser was unreadable: the chat starts empty and is replaced on the next save.");
+  return [];
+}
 
 // ------------------------------------------------------------------ toasts
 function toast(kind, title, text = "", ms = 3500, action = null) {
@@ -95,7 +119,14 @@ function headers(json = false) {
   return h;
 }
 $("api-key").value = store.get("apikey", "");
-$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
+$("api-key").onchange = () => {
+  if (store.set("apikey", $("api-key").value.trim())) {
+    storageWorked("apikey");
+    toast("success", "API key saved", "Kept in this browser only.");
+  } else {
+    storageFailed("apikey", "API key not saved", "This browser refused to store it: the key works in this tab only.");
+  }
+};
 
 let health = {model: "strata", images: false, max_context: 0};
 async function loadHealth() {
@@ -572,13 +603,16 @@ function samplingUntouched(s) {
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
-let messages = store.get("chat", []);
+let messages = loadChat();
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg}
 
 function saveChat() {
-  store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
-                                           files: (m.files || []).map((f) => ({name: f.name}))})));
+  const kept = store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
+                                                       files: (m.files || []).map((f) => ({name: f.name}))})));
+  if (kept) storageWorked("chat");
+  else storageFailed("chat", "Chat not saved", "This browser refused to store it: the chat stays in this tab only and is gone after a reload. Nothing was shortened.");
+  return kept;
 }
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
@@ -689,8 +723,10 @@ function updateAssistant(el, m, streaming) {
   }
   const bubble = el.querySelector(".st-bubble");
   if (m.error) {
-    bubble.innerHTML = `<div class="msg-error"></div>`;
-    bubble.firstChild.textContent = m.error;
+    // keep what already arrived visible: the text stays in the history and goes back to the model next turn,
+    // so it must not vanish from the answer just because the stream ended with an error
+    bubble.innerHTML = answerHtml(m) + `<div class="msg-error"></div>`;
+    bubble.querySelector(".msg-error").textContent = m.error;
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
@@ -1067,20 +1103,33 @@ $("s-apply").onclick = async () => {
               show: $("s-show").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true",
               mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
-  store.set("sampling", settings);
+  const kept = store.set("sampling", settings);
+  if (kept) storageWorked("sampling");
+  else storageFailed("sampling", "Sampling not stored", "They work for this tab, but this browser refused to keep them.");
   const share = $("s-share").getAttribute("aria-checked") === "true";
   openDrawer(false);
   if (share || sharedOn) {
     try {
       await saveShared(share, settings);
-      toast("success", "Sampling saved", share ? "Other apps (omp, API clients) use these settings from their next request."
-                                               : "Other apps use their own settings again.");
+      // say exactly what happened in each of the two stores: a local failure is not a save, a server
+      // success with share off means "own settings again", not "they use these"
+      if (kept) {
+        toast("success", "Sampling saved", share ? "Other apps (omp, API clients) use these settings from their next request."
+                                                 : "Other apps use their own settings again.");
+      } else {
+        toast("success", "Saved for other apps", share
+          ? "Other apps (omp, API clients) use these settings from their next request; this browser did not keep them."
+          : "Other apps use their own settings again; this browser did not keep your settings.");
+      }
     } catch (e) {
-      toast("error", "Saved here, but not for other apps", e.message, 6000);
+      const why = e && e.message ? ` ${e.message}` : "";
+      if (kept) toast("error", "Saved here, but not for other apps", e.message, 6000);
+      else toast("error", "Settings not saved",
+                 `This browser refused them and the server did not take them either: they work in this tab only.${why}`, 6000);
     }
     return;
   }
-  toast("success", "Sampling saved", settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "");
+  if (kept) toast("success", "Sampling saved", settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "");
 };
 $("sampling-btn").onclick = () => openDrawer(true);
 $("drawer-close").onclick = () => openDrawer(false);
