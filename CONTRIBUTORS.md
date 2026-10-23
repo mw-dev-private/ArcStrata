@@ -5,3 +5,4 @@ Niko1221 (MIT) is the origin of the idea and the engine; its history is not part
 authors are not ArcStrata contributors.
 
 - **Markus** ([mw-dev-private](https://github.com/mw-dev-private)) — direction, hypotheses, measurements, dead ends
+- **Anthropic Claude** — code, reviews
