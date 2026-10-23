@@ -21,14 +21,10 @@
 <header class="st-header">
   <span class="st-header__brand">Strata</span>
   <nav class="st-tabs" role="tablist" aria-label="Views">
-    <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
     <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" hidden>
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg>Images</button>
-    <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
+    <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="true" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
-    <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
   </nav>
   <span class="st-header__spacer"></span>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
@@ -38,8 +34,9 @@
 </header>
 
 <main>
+  <!-- Chat and About are disabled (2026-10-23): not needed; kept for rollback. -->
   <!-- ============================ Chat ============================ -->
-  <section class="view view--chat" id="view-chat" role="tabpanel" aria-labelledby="tab-btn-chat">
+  <section class="view view--chat" id="view-chat" role="tabpanel" aria-labelledby="tab-btn-chat" hidden>
     <div class="chat-scroll" id="chat-scroll">
       <div class="chat" id="chat">
         <div class="chat-empty" id="chat-empty">
@@ -95,7 +92,7 @@
   </section>
 
   <!-- ============================ Monitor ============================ -->
-  <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" hidden>
+  <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor">
     <div class="monitor">
       <div class="st-card state-card">
         <div class="state-card__head">

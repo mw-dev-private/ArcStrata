@@ -71,13 +71,13 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
   if (!saved) setTheme(e.matches ? "dark" : "light", false);
 });
 
-let tab = "chat";
+let tab = "monitor";
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
+  tab = "monitor";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
   if (tab === "images") $("img-prompt").focus();
-  if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
+  if (location.hash.slice(1) !== tab) history.replaceState(null, "", location.pathname);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
   if (tab === "about") loadConfig();
@@ -104,7 +104,7 @@ async function loadHealth() {
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
-    $("tab-btn-images").hidden = !health.image_generation;
+    $("tab-btn-images").hidden = true;
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
@@ -1090,10 +1090,9 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawe
 // ------------------------------------------------------------------ start
 setBusy(false);
 renderChat();
-const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
-if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
-showTab(location.hash.slice(1) || "chat");
+// Chat disabled (2026-10-23): /?q=... no longer starts a chat.
+loadHealth().then(loadMcp);
+showTab("monitor");
 poll();
 
 // ------------------------------------------------------------------ images (POST /v1/images/generations)
