@@ -109,11 +109,11 @@ tested for multi-GPU or vision throughput.
 ## Origin and contributors
 
 **Origin.** The idea and the engine are [Strata](https://github.com/Niko1221/Strata) by Niko1221, MIT. ArcStrata is an
-independent, Intel-Arc-only line built on it; upstream is not responsible for anything in this repository.
+independent, Intel-Arc-only line built on it.
 
 **Contributors — these four, and nobody else:**
 
-- **Markus** ([mw-dev-private](https://github.com/mw-dev-private)) — direction, hypotheses, measurements, dead ends
+- **Me / a real human** ([mw-dev-private](https://github.com/mw-dev-private)) — direction, hypotheses, measurements, dead ends
 - **DeepSeek** (deepseek-flash, DSH) — code, integration, measurements, documentation
 - **OpenAI Codex** — code, reviews
 - **Anthropic Claude** — code, reviews
