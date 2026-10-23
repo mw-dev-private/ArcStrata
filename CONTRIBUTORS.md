@@ -7,3 +7,4 @@ authors are not ArcStrata contributors.
 - **Markus** ([mw-dev-private](https://github.com/mw-dev-private)) — direction, hypotheses, measurements, dead ends
 - **Anthropic Claude** — code, reviews
 - **OpenAI Codex** — code, reviews
+- **DeepSeek** (deepseek-flash, DSH) — code, integration, measurements, documentation
