@@ -15,8 +15,8 @@ and the dead ends are mine.
 
 **All the numbers on this page are mine, measured on this PC.** For Strata itself, its install and its own speed
 tables see the [upstream README](https://github.com/Niko1221/Strata#readme) and, for the Intel port in general,
-[docs/INTEL.md](docs/INTEL.md). The live state as of 2026-10-20 — binary, commit, flags, deployment chain, open
-findings — is snapshotted in [docs/PROD-STATE-2026-10-20.md](docs/PROD-STATE-2026-10-20.md).
+[docs/INTEL.md](docs/INTEL.md). The live state as of 2026-10-23 — binary, commit, flags, deployment chain, open
+findings — is snapshotted in [docs/PROD-STATE-2026-10-23.md](docs/PROD-STATE-2026-10-23.md).
 
 > **Name and lineage.** ArcStrata is this branch — not XeStrata and not JR-Strata, which are other, independent
 > Intel forks. Upstream is [Niko1221/Strata](https://github.com/Niko1221/Strata) (MIT).
@@ -33,8 +33,8 @@ findings — is snapshotted in [docs/PROD-STATE-2026-10-20.md](docs/PROD-STATE-2
 > an iGPU or any other Intel card. If your card is not a B70, treat this branch as untested and use upstream.
 
 > [!NOTE]
-> **Every speed number here is measured the way I use the server every day**: 262,144-token context, thinking off,
-> temperature 0, batch 3 slots with MTP, Strata's own bench tool (`python tools/strata_bench.py --runs 1`).
+> **Every speed number here is measured on this PC with the settings I run**: 262,144-token context, thinking off,
+> temperature 0, batch 3 slots with MTP, Strata's own bench tool (`python tools/strata_bench.py --runs 3 --clients 4`).
 > Upstream's published tables use 4K answers on 32K prompts. Context and batching cost speed, and this machine's
 > profile is not the profile of a 16 GB card.
 
@@ -45,14 +45,14 @@ findings — is snapshotted in [docs/PROD-STATE-2026-10-20.md](docs/PROD-STATE-2
 | **GPU (production)** | Intel Arc Pro B70, 32 GB, PCI `04:00.0`, device `8086:e223`, Battlemage, `xe` driver (`/dev/dri/renderD128`), Level Zero compute runtime 26.35.39758.10 |
 | **GPU (test card)** | Intel Arc Pro B60, PCI `0b:00.0`, device `8086:e211` (`/dev/dri/renderD129`) — the card the kernel experiments ran on, and the card my embedding backend (`bge-m3`) sits on. **No number on this page comes from it** |
 | **CPU / RAM** | Intel Core i7-14700F, 123 GiB DDR4-3200 on an MSI B760 Gaming Plus WiFi DDR4 board |
-| **System** | Linux, kernel 7.0.0-34-generic |
+| **System** | Linux, kernel 7.0.0-38-generic |
 | **Compiler** | Intel oneAPI DPC++/C++ 2026.1.1 — `icx` and `icpx` both set explicitly |
-| **Build gate** | `-DSTRATA_ENABLE_SYCL=ON`: only `sycl/` is configured; the CUDA/HIP combination is a CMake error |
+| **Build gate** | `-DSTRATA_ENABLE_SYCL=ON`: only `sycl/` is configured; the native CUDA/Metal/ROCm backends are not in this tree |
 | **Device code** | SPIR-V, JIT-compiled for the B70 at first start with a persistent cache (`SYCL_CACHE_PERSISTENT=1`, fixed `SYCL_CACHE_DIR`), device picked by `ONEAPI_DEVICE_SELECTOR=level_zero:0`. `STRATA_SYCL_AOT` is deliberately **unset**; AOT measured ±0 |
 | **Model** | Qwen3.8-Flash-Next GSQ-RCO **IQ3_S** (two GGUF shards, the second passed as `--ple-gguf`) |
 | **Engine** | v0.1.45 fast base (`477ac13` line) + the ECAP fixes (in this `main`) — running binary `strata-v0145-ecap16` (sha256 `3110fd2c…`) |
 | **Serve / control** | this branch: upstream v0.1.45 base (`477ac13`) + port + tokenizer optimizers + the Python fixes below; config in [prod-config/PT3M-262k.sample.json](prod-config/PT3M-262k.sample.json) |
-| **Runtime settings** | `--max-context 262144`, `--kv int8`, `--batch 3 --spec 4` (MTP), `--pool-workers 12`, `--pcie-frac 0.20`, `--expert-cache auto`, `--conversation-cache-mib 16384 --conversation-cache-slots 8 --kv-resident 20480`, `--stream-experts`, vision on; armed gates: `STRATA_NATIVE_GRAPH=1`, `STRATA_BATCH_MTP=1`, `STRATA_TAIL_SKIP_IN_BATCH=1`, `STRATA_PREFILL_CPU_SHARE_BATCH=1`, `STRATA_SLOT_COPY_DIRECT=1`, int8 DPAS prompt experts **on by default** on Battlemage |
+| **Runtime settings** | `--max-context 262144`, `--kv int8`, `--batch 3 --spec 3` (MTP), `--pool-workers 12`, `--pcie-frac 0.20`, `--expert-cache auto`, `--conversation-cache-mib 16384 --conversation-cache-slots 8 --kv-resident 20480`, `--stream-experts`, vision on; armed gates: `STRATA_VERIFY_ECAP=16`, `STRATA_NATIVE_GRAPH=1`, `STRATA_BATCH_MTP=1`, `STRATA_TAIL_SKIP_IN_BATCH=1`, `STRATA_PREFILL_CPU_SHARE_BATCH=1`, `STRATA_SLOT_COPY_DIRECT=1`, int8 DPAS prompt experts **on by default** on Battlemage |
 
 ## How fast it runs here
 
@@ -76,7 +76,8 @@ run-to-run on long greedy generations. Parity tests need an identical side load,
 
 ## What changed since the first version of this README
 
-- **The engine moved to upstream v0.2.0-beta** and carries: the int8 DPAS expert prefill (on by default on
+- **The engine line is the v0.1.45 fast base + ECAP16** (the v0.2.0-beta/engine-int8 line was retired on
+  2026-10-23) and carries: the int8 DPAS expert prefill (on by default on
   Battlemage, `STRATA_PREFILL_MMQ=0` turns it off), conversation-cache **slot KV copies** on device
   (`STRATA_SLOT_COPY_DIRECT=1`), **batch prefill CPU share** with an exclusive pool guard
   (`STRATA_PREFILL_CPU_SHARE_BATCH=1`), **tail routing skip inside batch windows**
@@ -85,7 +86,7 @@ run-to-run on long greedy generations. Parity tests need an identical side load,
   (mapping 52–68 % faster, ~1–2 % cold end to end) and merge rank keys deduped onto the vocabulary's own strings
   (**−28.7 MB RSS at load**, measured in fresh processes). A cache-refresh experiment exists as a knob but is **off
   by default**: bounded FIFO refresh helps cold-diverse workloads (100 → 1 BPE calls) yet hurts resending
-  conversations 6× — details in `docs/PROD-STATE-2026-10-20.md`.
+  conversations 6× — details in `docs/PROD-STATE-2026-10-23.md`.
 - **Context doubled to 262,144 tokens**, batch serve with 3 slots is the normal mode, pool workers 12 at PCIe frac
   0.20 is today's baseline.
 - **2026-10-23 — the repository was cut down to the Intel-only line**: the running binary is
@@ -95,7 +96,7 @@ run-to-run on long greedy generations. Parity tests need an identical side load,
 
 ## What is in ArcStrata
 
-- **[docs/PROD-STATE-2026-10-20.md](docs/PROD-STATE-2026-10-20.md)** — the live state as a dated snapshot: binary,
+- **[docs/PROD-STATE-2026-10-23.md](docs/PROD-STATE-2026-10-23.md)** — the live state as a dated snapshot: binary,
   source commits, config, deployment/rollback chain, measured numbers, open findings from the code review.
 - **[prod-config/PT3M-262k.sample.json](prod-config/PT3M-262k.sample.json)** — the config the server actually runs
   (MCP bearer token redacted).

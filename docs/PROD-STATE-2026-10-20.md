@@ -1,6 +1,9 @@
 # Production state — 2026-10-20 (dated snapshot)
 
-What is actually running on this box right now. Kept as a snapshot; later changes get later snapshots.
+> **Historical snapshot.** This is the 2026-10-20 state. The current state is
+> [PROD-STATE-2026-10-23.md](PROD-STATE-2026-10-23.md).
+
+What was running on this box on 2026-10-20. Kept as a dated snapshot; later changes get later snapshots.
 
 ## Live pieces
 
