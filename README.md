@@ -1,6 +1,6 @@
-# Strata + Qwen3.8-Flash-Next on an Intel Arc Pro B70 32 GB — my fork
+# ArcStrata — Qwen3.8-Flash-Next on an Intel Arc Pro B70 32 GB
 
-*mw-dev-private, October 2026.* A fork of [Strata](https://github.com/Niko1221/Strata) (MIT) with the SYCL work and the
+*mw-dev-private, October 2026.* **ArcStrata** is a lean, Intel-Arc-only build of [Strata](https://github.com/Niko1221/Strata) (MIT): the SYCL work and the
 settings I run every day to serve **Qwen3.8-Flash-Next (GSQ-RCO IQ3_S)** on an **Intel Arc Pro B70** behind a coding
 agent, a local assistant and an MCP client. Work done with several coding agents (Claude/Codex/OpenCode) as the
 assistants; the direction, the hypotheses and the dead ends are mine.
@@ -10,8 +10,11 @@ tables see the [upstream README](https://github.com/Niko1221/Strata#readme) and,
 [docs/INTEL.md](docs/INTEL.md). The exact live state of today — binary, commit, flags, deployment chain, open
 findings — is snapshotted in [docs/PROD-STATE-2026-10-20.md](docs/PROD-STATE-2026-10-20.md).
 
+> **Name and lineage.** ArcStrata is this branch — not XeStrata and not JR-Strata, which are other, independent
+> Intel forks. Upstream is [Niko1221/Strata](https://github.com/Niko1221/Strata) (MIT).
+
 > [!IMPORTANT]
-> **This fork is Intel Arc only, and it is only the B70.** Everything here is the Intel engine: the SYCL sources under
+> **ArcStrata is Intel Arc only, and it is only the B70.** Everything here is the Intel engine: the SYCL sources under
 > `sycl/`, built with `-DSTRATA_ENABLE_SYCL=ON`, after which upstream's own CMake configures nothing else and stops
 > the build outright if `STRATA_ENABLE_CUDA` or `STRATA_ENABLE_HIP` is set as well — the backends are mutually
 > exclusive by design. So **no CUDA, no ROCm, no Metal/Mac, no multi-GPU, no Windows**: those paths are upstream's,
@@ -78,7 +81,7 @@ run-to-run on long greedy generations. Parity tests need an identical side load,
 - **Context doubled to 262,144 tokens**, batch serve with 3 slots is the normal mode, pool workers 12 at PCIe frac
   0.20 is today's baseline.
 
-## What is in this fork
+## What is in ArcStrata
 
 - **[docs/PROD-STATE-2026-10-20.md](docs/PROD-STATE-2026-10-20.md)** — the live state as a dated snapshot: binary,
   source commits, config, deployment/rollback chain, measured numbers, open findings from the code review.
